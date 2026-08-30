@@ -75,13 +75,8 @@ CONNECT_FIELDS: dict[str, list[dict[str, Any]]] = {
         {"key": "joint_shm", "label": "joint SHM", "type": "text"},
     ],
     "ft": [
-        {"key": "endpoint", "label": "端点 / 端口", "type": "text"},
-        {"key": "dll_path", "label": "DLL 路径 (Paxini)", "type": "text"},
-        {"key": "f_target", "label": "目标接触力 f_target", "type": "number"},
-        {"key": "force_filter_window", "label": "力滤波窗口", "type": "number"},
-        {"key": "force_axis", "label": "接触力轴 Fx/Fy/Fz", "type": "text"},
-        {"key": "channel", "label": "力组通道", "type": "number"},
-        {"key": "paxini_channel", "label": "Paxini 打开通道", "type": "number"},
+        {"key": "endpoint", "label": "端点", "type": "text"},
+        {"key": "backend", "label": "后端 stub", "type": "text"},
     ],
     "tactile": [],
 }
@@ -329,63 +324,57 @@ def _build_viz(kind: str, sample: dict[str, Any], *, dry_run: bool, tick: int = 
             )
 
     elif kind == "ft":
+        force = sample.get("force")
+        torque = sample.get("torque")
         wrench = sample.get("wrench")
-        labels = sample.get("wrench_labels") or ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
-        if wrench is None and dry_run:
-            wrench = [
-                0.15 * math.sin(t * 0.9),
-                0.12 * math.cos(t * 1.1),
-                max(0.0, 0.55 + 0.45 * math.sin(t * 0.7)),
-                0.02 * math.sin(t * 1.3),
-                0.02 * math.cos(t * 1.05),
-                0.01 * math.sin(t * 0.5),
+        if (force is None or torque is None) and isinstance(wrench, list) and len(wrench) >= 6:
+            force = wrench[:3]
+            torque = wrench[3:6]
+        if force is None and dry_run:
+            force = [
+                0.8 * math.sin(t * 0.9),
+                0.6 * math.cos(t * 1.1),
+                2.0 + 0.5 * math.sin(t * 0.55),
             ]
-            viz["note"] = "dry-run 连续占位六维力 (Fx..Tz)"
-        if isinstance(wrench, list) and len(wrench) >= 6:
-            force = [float(x) for x in wrench[:3]]
-            torque = [float(x) for x in wrench[3:6]]
+            torque = [
+                0.05 * math.sin(t * 1.3 + 0.2),
+                0.04 * math.cos(t * 1.05),
+                0.03 * math.sin(t * 0.7),
+            ]
+            viz["note"] = "dry-run 腕部六维力 (HIK_LMM_FORCE_TORQUE)"
+        if isinstance(force, list) and isinstance(torque, list) and len(force) >= 3 and len(torque) >= 3:
+            fl = sample.get("force_labels") or ["Fx", "Fy", "Fz"]
+            tl = sample.get("torque_labels") or ["Tx", "Ty", "Tz"]
             viz["charts"].append(
                 {
                     "type": "bars",
-                    "title": "力 Fx Fy Fz",
-                    "labels": list(labels[:3]),
-                    "values": force,
+                    "title": "力 force (N)",
+                    "labels": list(fl)[:3],
+                    "values": [float(x) for x in force[:3]],
                 }
             )
             viz["charts"].append(
                 {
                     "type": "bars",
-                    "title": "力矩 Tx Ty Tz",
-                    "labels": list(labels[3:6]),
-                    "values": torque,
+                    "title": "力矩 torque (N·m)",
+                    "labels": list(tl)[:3],
+                    "values": [float(x) for x in torque[:3]],
                 }
             )
-            f_smooth = sample.get("force_smooth")
-            if f_smooth is None:
-                f_smooth = force[2]
-            f_target = sample.get("f_target")
-            if f_target is None:
-                f_target = 1.0
-            viz["charts"].append(
-                {
-                    "type": "gauge",
-                    "title": f"接触力 {sample.get('force_axis') or 'Fz'} (滤后)",
-                    "value": float(f_smooth),
-                    "min": 0.0,
-                    "max": max(float(f_target) * 2.0, abs(float(f_smooth)) * 1.2, 1.0),
-                }
-            )
+            bias = sample.get("bias") or [0, 0, 0, 0, 0, 0]
             viz["metrics"].extend(
                 [
-                    {"label": "F_raw", "value": f"{float(sample.get('force_raw', force[2])):.4f}"},
-                    {"label": "F_smooth", "value": f"{float(f_smooth):.4f}"},
-                    {"label": "f_target", "value": f"{float(f_target):.4f}"},
+                    {"label": "|F|", "value": f"{float(sample.get('force_norm', 0)):.4f}"},
+                    {"label": "|T|", "value": f"{float(sample.get('torque_norm', 0)):.4f}"},
                     {
-                        "label": "force_err",
-                        "value": f"{float(sample.get('force_error', float(f_smooth) - float(f_target))):.4f}",
+                        "label": "bias F",
+                        "value": ", ".join(f"{float(v):.3f}" for v in list(bias)[:3]),
                     },
-                    {"label": "contact", "value": str(sample.get("contact"))},
-                    {"label": "filter", "value": str(sample.get("force_filter_window", "—"))},
+                    {
+                        "label": "bias T",
+                        "value": ", ".join(f"{float(v):.3f}" for v in list(bias)[3:6]),
+                    },
+                    {"label": "endpoint", "value": str(sample.get("endpoint", "—"))},
                 ]
             )
         elif dry_run:
