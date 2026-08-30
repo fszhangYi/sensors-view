@@ -12,9 +12,6 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[1]
-USERS_PATH = ROOT / "config" / "users.json"
-AUTH_BOOTSTRAP_PATH = ROOT / "config" / ".auth.json"
 COOKIE_NAME = "sensors_view_session"
 SESSION_TTL_SEC = 7 * 24 * 3600
 PBKDF2_ITERATIONS = 120_000
@@ -34,6 +31,29 @@ _lock = threading.RLock()
 _sessions: dict[str, dict[str, Any]] = {}
 _users: list[dict[str, Any]] = []
 _state: dict[str, Any] = {"enabled": True, "username_hint": "sensors"}
+
+
+def _auth_config_dir() -> Path:
+    """Writable config dir: AppData (desktop) > SENSORS_VIEW_USER_DATA > package root."""
+    env = (os.environ.get("SENSORS_VIEW_USER_DATA") or "").strip()
+    if env:
+        return Path(env) / "config"
+    try:
+        from app.paths import is_frozen, user_data_dir
+
+        if is_frozen():
+            return user_data_dir() / "config"
+    except Exception:
+        pass
+    return Path(__file__).resolve().parents[1] / "config"
+
+
+def _users_path() -> Path:
+    return _auth_config_dir() / "users.json"
+
+
+def _bootstrap_path() -> Path:
+    return _auth_config_dir() / ".auth.json"
 
 
 def _env_truthy(name: str) -> bool:
@@ -71,19 +91,21 @@ def _normalize_role(role: str) -> str:
 
 
 def _save_users_unlocked() -> None:
-    USERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    path = _users_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"version": 1, "users": _users}
-    USERS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     try:
-        os.chmod(USERS_PATH, 0o600)
+        os.chmod(path, 0o600)
     except OSError:
         pass
 
 
 def _load_users_file() -> list[dict[str, Any]]:
-    if not USERS_PATH.is_file():
+    path = _users_path()
+    if not path.is_file():
         return []
-    raw = json.loads(USERS_PATH.read_text(encoding="utf-8"))
+    raw = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(raw, dict) and isinstance(raw.get("users"), list):
         return [u for u in raw["users"] if isinstance(u, dict)]
     if isinstance(raw, list):
@@ -239,8 +261,9 @@ def init_auth() -> dict[str, Any]:
             _users = [row]
             _save_users_unlocked()
             if source == "bootstrap":
-                AUTH_BOOTSTRAP_PATH.parent.mkdir(parents=True, exist_ok=True)
-                AUTH_BOOTSTRAP_PATH.write_text(
+                boot = _bootstrap_path()
+                boot.parent.mkdir(parents=True, exist_ok=True)
+                boot.write_text(
                     json.dumps(
                         {
                             "username": user,
@@ -254,11 +277,11 @@ def init_auth() -> dict[str, Any]:
                     encoding="utf-8",
                 )
                 try:
-                    os.chmod(AUTH_BOOTSTRAP_PATH, 0o600)
+                    os.chmod(boot, 0o600)
                 except OSError:
                     pass
                 print(
-                    f"[auth] created admin in config/users.json (user={user} password={password})",
+                    f"[auth] created admin (user={user} password={password}) → {boot}",
                     flush=True,
                 )
             else:

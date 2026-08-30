@@ -29,7 +29,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="icon" href="/static/assets/favicon.svg" type="image/svg+xml" />
-  <link rel="stylesheet" href="/static/style.css?v=19" />
+  <link rel="stylesheet" href="/static/style.css?v=32" />
 </head>
 <body class="sensors-view-page" data-i18n-title="meta.title" hidden>
   <div class="noise" aria-hidden="true"></div>
@@ -68,10 +68,7 @@
     <div class="summary" id="summary"></div>
     <section class="batch-bar" id="batch-bar" aria-label="batch sampling">
       <div class="batch-controls">
-        <label class="field rate-field">
-          <span class="field-label" data-i18n="field.sampleRate">采样频率 Hz</span>
-          <input id="batch-rate" type="number" min="0.2" max="30" step="0.1" value="2" />
-        </label>
+        <p class="batch-lede" data-i18n="batch.lede">各卡片单独设定目标频率与上下限；采集中按实测 Hz 更新 status</p>
         <label class="toggle block">
           <input type="checkbox" id="batch-dry-run" {% if dry_run %}checked{% endif %} />
           <span data-i18n="field.dryRun">dry-run（不连真机）</span>
@@ -82,12 +79,44 @@
           <span class="field-label" data-i18n="field.batchSeq">序号</span>
           <input id="batch-seq" type="text" autocomplete="off" placeholder="001" />
         </label>
+        <label class="field export-dir-field">
+          <span class="field-label" data-i18n="field.exportDir">保存文件夹</span>
+          <input id="export-dir" type="text" autocomplete="off" spellcheck="false" />
+        </label>
         <button type="button" class="btn ghost" id="btn-batch-save" hidden disabled data-i18n="btn.batchSave">保存数据文件</button>
+        <button type="button" class="btn ghost" id="btn-batch-post" hidden disabled data-i18n="btn.batchPost">批后处理</button>
         <span class="form-hint" id="batch-hint"></span>
       </div>
     </section>
     <div class="grid" id="device-grid"></div>
   </main>
+
+  <aside class="modal live-modal" id="live-modal" hidden>
+    <div class="modal-panel live-panel" role="dialog" aria-modal="true" aria-labelledby="live-title">
+      <div class="live-shell">
+        <aside class="live-rail">
+          <header class="live-rail-head">
+            <p class="brand tiny" data-i18n="live.kicker">live · batch</p>
+            <h2 id="live-title" data-i18n="live.title">连续采样</h2>
+            <p class="live-rail-lede" data-i18n="live.lede">左侧状态 · 右侧实时可视化</p>
+          </header>
+          <div class="live-status-list" id="live-status-list"></div>
+          <div class="live-rail-actions">
+            <button type="button" class="btn danger" id="btn-live-stop" data-i18n="btn.batchStop">停止</button>
+            <label class="field live-seq-field" id="live-seq-wrap" hidden>
+              <span class="field-label" data-i18n="field.batchSeq">序号</span>
+              <input id="live-seq" type="text" autocomplete="off" placeholder="001" />
+            </label>
+            <button type="button" class="btn primary" id="btn-live-save" hidden disabled data-i18n="btn.batchSave">保存数据文件</button>
+            <button type="button" class="btn ghost" id="btn-live-post" hidden disabled data-i18n="btn.batchPost">批后处理</button>
+            <button type="button" class="btn ghost" id="btn-live-close" data-i18n="btn.close">关闭</button>
+          </div>
+          <p class="form-hint" id="live-hint"></p>
+        </aside>
+        <section class="live-stage" id="live-stage" aria-label="live visualization"></section>
+      </div>
+    </div>
+  </aside>
 
   <aside class="modal" id="modal" hidden>
     <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modal-title">
@@ -104,9 +133,10 @@
 
         <div class="stream-row">
           <label class="field rate-field">
-            <span class="field-label" data-i18n="field.sampleRate">采样频率 Hz</span>
-            <input id="sample-rate" type="number" min="0.2" max="30" step="0.1" value="2" />
+            <span class="field-label" data-i18n="field.sampleRate">目标频率 Hz</span>
+            <input id="sample-rate" type="number" min="0.2" max="2000" step="0.1" value="2" />
           </label>
+          <p class="form-hint rate-bounds-hint" id="rate-bounds-hint"></p>
           <label class="toggle block">
             <input type="checkbox" id="sample-dry-run" {% if dry_run %}checked{% endif %} />
             <span data-i18n="field.dryRun">dry-run（不连真机）</span>
@@ -241,8 +271,8 @@
       dryRun: {{ dry_run | tojson }},
     };
   </script>
-  <script src="/static/i18n.js?v=19"></script>
+  <script src="/static/i18n.js?v=32"></script>
   <script src="/static/appearance.js?v=19"></script>
-  <script src="/static/app.js?v=19"></script>
+  <script src="/static/app.js?v=32"></script>
 </body>
 </html>

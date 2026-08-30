@@ -22,18 +22,27 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from . import auth as view_auth
+from .paths import (
+    app_package_dir,
+    default_export_dir,
+    default_view_config,
+    load_export_dir,
+    project_root,
+    save_export_dir,
+    sensors_src_dir,
+)
 
 
-ROOT = Path(__file__).resolve().parents[1]
-SENSORS_SRC = ROOT / "sensors" / "src"
+ROOT = project_root()
+SENSORS_SRC = sensors_src_dir()
 if SENSORS_SRC.is_dir() and str(SENSORS_SRC) not in sys.path:
     sys.path.insert(0, str(SENSORS_SRC))
 
 from sensors.core.base import SensorContext  # noqa: E402
 from sensors.runtime.manager import SensorManager  # noqa: E402
 
-APP_DIR = Path(__file__).resolve().parent
-DEFAULT_VIEW_CFG = ROOT / "configs" / "view.yaml"
+APP_DIR = app_package_dir()
+DEFAULT_VIEW_CFG = default_view_config() if default_view_config().is_file() else (ROOT / "configs" / "view.yaml")
 
 CONNECT_FIELDS: dict[str, list[dict[str, Any]]] = {
     "bus": [
@@ -96,6 +105,10 @@ _mgr: SensorManager | None = None
 _view_config_path: Path = DEFAULT_VIEW_CFG
 _sessions: dict[str, "SampleSession"] = {}
 _sessions_lock = threading.Lock()
+_export_jobs: dict[str, dict[str, Any]] = {}
+_export_jobs_lock = threading.Lock()
+_postprocess_jobs: dict[str, dict[str, Any]] = {}
+_postprocess_jobs_lock = threading.Lock()
 
 
 class SampleRequest(BaseModel):
@@ -129,6 +142,69 @@ class UserUpdateBody(BaseModel):
     role: str | None = None
     enabled: bool | None = None
     password: str | None = None
+
+
+class ExportDirBody(BaseModel):
+    dir: str = ""
+
+
+class ExportSaveBody(BaseModel):
+    filename: str = ""
+    data: Any = None
+    dir: str | None = None
+
+
+class PostprocessBody(BaseModel):
+    """Convert sensors-view-*.json under export dir into hik episode folders."""
+
+    dir: str | None = None
+    seq: str | None = None
+    filename: str | None = None
+    out_dir: str | None = None
+    interval_ms: float = 200.0
+    write_video: bool = False
+
+
+def _safe_export_filename(name: str) -> str:
+    base = Path(str(name or "").strip().replace("\\", "/")).name
+    if not base or base in {".", ".."}:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    if not base.lower().endswith(".json"):
+        base = f"{base}.json"
+    if any(c in base for c in '<>:"|?*') or not all(c.isalnum() or c in "._-" for c in base):
+        raise HTTPException(status_code=400, detail="filename has invalid characters")
+    return base
+
+
+def _resolve_export_dir(raw: str | None = None) -> Path:
+    text = (raw or "").strip()
+    if text:
+        return Path(text).expanduser().resolve()
+    return load_export_dir()
+
+
+def _write_export_json(directory: Path, filename: str, data: Any) -> Path:
+    import json
+
+    directory = directory.resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    target = (directory / filename).resolve()
+    try:
+        target.relative_to(directory)
+    except ValueError as exc:
+        raise ValueError("path escapes export dir") from exc
+    target.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return target
+
+
+def _resolve_export_target(directory: Path, filename: str) -> Path:
+    directory = directory.resolve()
+    target = (directory / filename).resolve()
+    try:
+        target.relative_to(directory)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="path escapes export dir") from exc
+    return target
 
 
 @dataclass
@@ -779,6 +855,7 @@ def index(request: Request) -> HTMLResponse:
 @app.get("/api/meta")
 def api_meta() -> dict[str, Any]:
     mgr = get_manager()
+    export_dir = load_export_dir()
     return {
         "title": _view_cfg.get("title", "sensors-view"),
         "site": mgr.bundle.site,
@@ -788,7 +865,187 @@ def api_meta() -> dict[str, Any]:
         ),
         "device_ids": mgr.ids(),
         "count": len(mgr),
+        "export_dir": str(export_dir),
+        "export_dir_default": str(default_export_dir()),
     }
+
+
+@app.get("/api/export")
+def api_export_get() -> dict[str, Any]:
+    return {
+        "dir": str(load_export_dir()),
+        "default_dir": str(default_export_dir()),
+    }
+
+
+@app.put("/api/export")
+def api_export_put(body: ExportDirBody) -> dict[str, Any]:
+    text = (body.dir or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="dir required")
+    try:
+        path = save_export_dir(Path(text))
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"cannot use dir: {exc}") from exc
+    return {"ok": True, "dir": str(path), "default_dir": str(default_export_dir())}
+
+
+@app.post("/api/export")
+def api_export_save(body: ExportSaveBody) -> dict[str, Any]:
+    """Queue JSON export on a dedicated background thread (non-blocking)."""
+    import copy
+
+    filename = _safe_export_filename(body.filename)
+    if body.data is None:
+        raise HTTPException(status_code=400, detail="data required")
+    directory = _resolve_export_dir(body.dir)
+    try:
+        target = _resolve_export_target(directory, filename)
+        directory.mkdir(parents=True, exist_ok=True)
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"cannot use dir: {exc}") from exc
+
+    job_id = uuid.uuid4().hex
+    data_copy = copy.deepcopy(body.data)
+    persist_dir = bool((body.dir or "").strip())
+
+    with _export_jobs_lock:
+        _export_jobs[job_id] = {
+            "status": "running",
+            "path": str(target),
+            "dir": str(directory.resolve()),
+            "filename": filename,
+            "error": None,
+        }
+
+    def _worker() -> None:
+        try:
+            written = _write_export_json(directory, filename, data_copy)
+            if persist_dir:
+                try:
+                    save_export_dir(directory)
+                except OSError:
+                    pass
+            with _export_jobs_lock:
+                job = _export_jobs.get(job_id)
+                if job is not None:
+                    job.update(status="done", path=str(written), error=None)
+        except Exception as exc:  # noqa: BLE001
+            with _export_jobs_lock:
+                job = _export_jobs.get(job_id)
+                if job is not None:
+                    job.update(status="error", error=str(exc))
+
+    threading.Thread(target=_worker, name=f"sensors-view-export-{job_id[:8]}", daemon=True).start()
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "running",
+        "path": str(target),
+        "dir": str(directory.resolve()),
+        "filename": filename,
+    }
+
+
+@app.get("/api/export/jobs/{job_id}")
+def api_export_job(job_id: str) -> dict[str, Any]:
+    with _export_jobs_lock:
+        job = _export_jobs.get(job_id)
+        snapshot = dict(job) if job else None
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="unknown export job")
+    return {"ok": True, "job_id": job_id, **snapshot}
+
+
+@app.post("/api/postprocess")
+def api_postprocess(body: PostprocessBody) -> dict[str, Any]:
+    """Queue hik-format batch postprocess on a dedicated background thread."""
+    from .postprocess import convert_file, list_export_jsons
+
+    directory = _resolve_export_dir(body.dir)
+    if not directory.is_dir():
+        raise HTTPException(status_code=400, detail=f"export dir not found: {directory}")
+
+    try:
+        if body.filename:
+            name = Path(str(body.filename).replace("\\", "/")).name
+            files = [directory / name]
+            if not files[0].is_file():
+                raise FileNotFoundError(str(files[0]))
+        else:
+            files = list_export_jsons(directory, seq=(body.seq or "").strip() or None)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    if not files:
+        raise HTTPException(status_code=404, detail="no sensors-view export JSON found")
+
+    out_root = Path(body.out_dir).expanduser().resolve() if (body.out_dir or "").strip() else (directory / "aligned")
+    interval = float(body.interval_ms) if body.interval_ms and body.interval_ms > 0 else 200.0
+    write_video = bool(body.write_video)
+
+    job_id = uuid.uuid4().hex
+    file_list = [str(p.resolve()) for p in files]
+    with _postprocess_jobs_lock:
+        _postprocess_jobs[job_id] = {
+            "status": "running",
+            "dir": str(directory.resolve()),
+            "out_dir": str(out_root),
+            "files": file_list,
+            "results": [],
+            "error": None,
+        }
+
+    def _worker() -> None:
+        results: list[dict[str, Any]] = []
+        try:
+            out_root.mkdir(parents=True, exist_ok=True)
+            for fp in file_list:
+                results.append(
+                    convert_file(
+                        Path(fp),
+                        out_root,
+                        interval_ms=interval,
+                        write_video=write_video,
+                    )
+                )
+            with _postprocess_jobs_lock:
+                job = _postprocess_jobs.get(job_id)
+                if job is not None:
+                    job.update(
+                        status="done",
+                        results=results,
+                        path=results[-1]["path"] if results else str(out_root),
+                        error=None,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            with _postprocess_jobs_lock:
+                job = _postprocess_jobs.get(job_id)
+                if job is not None:
+                    job.update(status="error", results=results, error=str(exc))
+
+    threading.Thread(target=_worker, name=f"sensors-view-post-{job_id[:8]}", daemon=True).start()
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "running",
+        "dir": str(directory.resolve()),
+        "out_dir": str(out_root),
+        "files": file_list,
+    }
+
+
+@app.get("/api/postprocess/jobs/{job_id}")
+def api_postprocess_job(job_id: str) -> dict[str, Any]:
+    with _postprocess_jobs_lock:
+        job = _postprocess_jobs.get(job_id)
+        snapshot = dict(job) if job else None
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="unknown postprocess job")
+    return {"ok": True, "job_id": job_id, **snapshot}
 
 
 @app.get("/api/probe")

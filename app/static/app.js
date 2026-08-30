@@ -29,14 +29,26 @@
   const btnStop = document.getElementById("btn-stop");
   const btnOnce = document.getElementById("btn-once");
   const btnSaveStream = document.getElementById("btn-save-stream");
-  const batchRateEl = document.getElementById("batch-rate");
   const batchDryRunEl = document.getElementById("batch-dry-run");
   const btnBatchStart = document.getElementById("btn-batch-start");
   const btnBatchStop = document.getElementById("btn-batch-stop");
   const btnBatchSave = document.getElementById("btn-batch-save");
+  const btnBatchPost = document.getElementById("btn-batch-post");
   const batchSeqEl = document.getElementById("batch-seq");
   const batchSeqWrap = document.getElementById("batch-seq-wrap");
   const batchHint = document.getElementById("batch-hint");
+  const exportDirEl = document.getElementById("export-dir");
+  const liveModal = document.getElementById("live-modal");
+  const liveStage = document.getElementById("live-stage");
+  const liveStatusList = document.getElementById("live-status-list");
+  const liveHint = document.getElementById("live-hint");
+  const btnLiveStop = document.getElementById("btn-live-stop");
+  const btnLiveClose = document.getElementById("btn-live-close");
+  const btnLiveSave = document.getElementById("btn-live-save");
+  const btnLivePost = document.getElementById("btn-live-post");
+  const liveSeqEl = document.getElementById("live-seq");
+  const liveSeqWrap = document.getElementById("live-seq-wrap");
+  const rateBoundsHint = document.getElementById("rate-bounds-hint");
   const modalPreview = document.getElementById("modal-preview");
   const vizNote = document.getElementById("viz-note");
   const vizJson = document.getElementById("viz-json");
@@ -51,6 +63,22 @@
   const autoCommandEl = document.getElementById("auto-command");
   const commandHint = document.getElementById("command-hint");
 
+  const RATE_PREFS_KEY = "sensors-view.ratePrefs";
+  /** @type {Record<string, { min: number, max: number, defaultHz: number }>} */
+  const KIND_RATE_DEFAULTS = {
+    realsense: { min: 5, max: 30, defaultHz: 15 },
+    arm: { min: 100, max: 1000, defaultHz: 100 },
+    gello: { min: 100, max: 1000, defaultHz: 100 },
+    gripper: { min: 1, max: 50, defaultHz: 10 },
+    tactile: { min: 1, max: 50, defaultHz: 10 },
+    ft: { min: 100, max: 2000, defaultHz: 200 },
+    bus: { min: 1, max: 50, defaultHz: 10 },
+    pipeline: { min: 1, max: 50, defaultHz: 10 },
+  };
+  const FALLBACK_RATE = { min: 1, max: 50, defaultHz: 10 };
+  const RATE_WINDOW = 24;
+  const RATE_TOL_RATIO = 0.2;
+
   let busy = false;
   let currentDevice = null;
   let sessionId = null;
@@ -60,18 +88,43 @@
   let lastPayload = null;
   let streamRecords = [];
   let streamRecording = false;
+  /** @type {number[]} */
+  let streamRateTimes = [];
+  let streamMeasuredHz = null;
+  let streamRateOk = null;
   let baseline = null; // number[]
   let lastDevices = [];
   const deviceCache = {};
   const selectedIds = new Set();
+  /** ids that already received a default checkbox decision */
+  const selectionSeeded = new Set();
+  const DEFAULT_UNCHECKED_KINDS = new Set(["tactile", "ft", "bus"]);
+  /** @type {Record<string, { hz: number, hzMin: number, hzMax: number }>} */
+  let ratePrefs = loadRatePrefs();
   let batchRunning = false;
-  let batchTimer = null;
-  let batchTickInFlight = false;
   let batchStartedAt = 0;
-  /** @type {{ id: string, sessionId: string, kind: string, name: string }[]} */
+  /**
+   * @type {{
+   *   id: string,
+   *   sessionId: string,
+   *   kind: string,
+   *   name: string,
+   *   hz: number,
+   *   hzMin: number,
+   *   hzMax: number,
+   *   timer: ReturnType<typeof setInterval> | null,
+   *   tickInFlight: boolean,
+   *   times: number[],
+   *   measuredHz: number | null,
+   *   rateOk: boolean | null,
+   *   sampleCount: number,
+   * }[]}
+   */
   let batchSessions = [];
-  /** @type {object[]} */
-  let batchFrames = [];
+  /** @type {Record<string, object[]>} */
+  let batchStreams = {};
+  /** @type {Record<string, { hz: number, hzMin: number, hzMax: number, measuredHz: number | null, rateOk: boolean | null, kind: string, name: string }>} */
+  let batchMeta = {};
   let batchCanSave = false;
 
   const _fetch = window.fetch.bind(window);
@@ -217,14 +270,128 @@
       .replaceAll('"', "&quot;");
   }
 
-  function clampHz(v) {
+  function loadRatePrefs() {
+    try {
+      const raw = localStorage.getItem(RATE_PREFS_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveRatePrefs() {
+    try {
+      localStorage.setItem(RATE_PREFS_KEY, JSON.stringify(ratePrefs));
+    } catch {
+      /* ignore quota */
+    }
+  }
+
+  function kindRateDefaults(kind) {
+    return KIND_RATE_DEFAULTS[kind] || FALLBACK_RATE;
+  }
+
+  function getRatePrefs(id, kind) {
+    const def = kindRateDefaults(kind);
+    const saved = ratePrefs[id] || {};
+    let hzMin = Number(saved.hzMin);
+    let hzMax = Number(saved.hzMax);
+    let hz = Number(saved.hz);
+    if (!Number.isFinite(hzMin)) hzMin = def.min;
+    if (!Number.isFinite(hzMax)) hzMax = def.max;
+    if (hzMax < hzMin) {
+      const tmp = hzMin;
+      hzMin = hzMax;
+      hzMax = tmp;
+    }
+    if (!Number.isFinite(hz)) hz = def.defaultHz;
+    hz = Math.min(hzMax, Math.max(hzMin, hz));
+    return { hz, hzMin, hzMax };
+  }
+
+  function setRatePrefs(id, kind, patch) {
+    const cur = getRatePrefs(id, kind);
+    const next = { ...cur, ...patch };
+    if (next.hzMax < next.hzMin) {
+      const tmp = next.hzMin;
+      next.hzMin = next.hzMax;
+      next.hzMax = tmp;
+    }
+    next.hz = Math.min(next.hzMax, Math.max(next.hzMin, Number(next.hz)));
+    ratePrefs[id] = next;
+    saveRatePrefs();
+    return next;
+  }
+
+  function clampDeviceHz(v, prefs) {
     const n = Number(v);
-    if (!Number.isFinite(n)) return 2;
-    return Math.min(30, Math.max(0.2, n));
+    if (!Number.isFinite(n)) return prefs.hz;
+    return Math.min(prefs.hzMax, Math.max(prefs.hzMin, n));
+  }
+
+  function intervalMsForHz(hz) {
+    const n = Number(hz);
+    if (!Number.isFinite(n) || n <= 0) return 500;
+    return Math.max(1, Math.round(1000 / n));
+  }
+
+  function observeRate(times, hz, now = performance.now()) {
+    times.push(now);
+    while (times.length > RATE_WINDOW) times.shift();
+    if (times.length < 3) {
+      return { measured: null, ok: null };
+    }
+    const span = times[times.length - 1] - times[0];
+    if (span <= 0) return { measured: null, ok: null };
+    const measured = ((times.length - 1) * 1000) / span;
+    const target = Number(hz) || 0;
+    const tol = Math.max(target * RATE_TOL_RATIO, Math.min(2, Math.max(0.5, target * 0.05)));
+    const ok = Math.abs(measured - target) <= tol;
+    return { measured, ok };
+  }
+
+  function formatMeasured(hz) {
+    if (hz == null || !Number.isFinite(hz)) return "—";
+    if (hz >= 100) return hz.toFixed(0);
+    if (hz >= 10) return hz.toFixed(1);
+    return hz.toFixed(2);
+  }
+
+  function rateStatusLabel(ok) {
+    if (ok === true) return t("stream.rateOk");
+    if (ok === false) return t("stream.rateBad");
+    return t("stream.rateWarm");
+  }
+
+  function clampHz(v) {
+    if (!currentDevice) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return 2;
+      return Math.min(2000, Math.max(0.2, n));
+    }
+    const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
+    return clampDeviceHz(v, prefs);
   }
 
   function intervalMs() {
-    return Math.round(1000 / clampHz(rateEl.value));
+    return intervalMsForHz(clampHz(rateEl.value));
+  }
+
+  function applyModalRateBounds() {
+    if (!currentDevice || !rateEl) return;
+    const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
+    rateEl.min = String(prefs.hzMin);
+    rateEl.max = String(prefs.hzMax);
+    rateEl.step = prefs.hzMax >= 100 ? "1" : "0.1";
+    rateEl.value = String(prefs.hz);
+    if (rateBoundsHint) {
+      rateBoundsHint.textContent = t("field.rateBounds", {
+        min: prefs.hzMin,
+        max: prefs.hzMax,
+      });
+    }
   }
 
   function control() {
@@ -252,34 +419,409 @@
       .join("");
   }
 
-  function clampBatchHz(v) {
-    const n = Number(v);
-    if (!Number.isFinite(n)) return 2;
-    return Math.min(30, Math.max(0.2, n));
-  }
-
-  function batchIntervalMs() {
-    return Math.round(1000 / clampBatchHz(batchRateEl?.value));
-  }
-
   function isOnlineStatus(status) {
     return status === "ok" || status === "warn";
+  }
+
+  function batchSampleTotal() {
+    return Object.values(batchStreams).reduce((n, arr) => n + (arr?.length || 0), 0);
+  }
+
+  function batchRateOkCount() {
+    return batchSessions.filter((s) => s.rateOk === true).length;
+  }
+
+  function updateBatchHintText() {
+    if (!batchHint || !batchRunning) return;
+    batchHint.textContent = t("batch.running", {
+      n: batchSessions.length,
+      count: batchSampleTotal(),
+      ok: batchRateOkCount(),
+    });
   }
 
   function setBatchUi() {
     if (!btnBatchStart) return;
     btnBatchStart.disabled = batchRunning;
     btnBatchStop.disabled = !batchRunning;
-    if (batchRateEl) batchRateEl.disabled = batchRunning;
     if (batchDryRunEl) batchDryRunEl.disabled = batchRunning;
     grid?.querySelectorAll(".card-check").forEach((el) => {
       el.disabled = batchRunning;
     });
-    const showSave = batchCanSave && !batchRunning && batchFrames.length > 0;
-    if (batchSeqWrap) batchSeqWrap.hidden = !showSave;
+    grid?.querySelectorAll(".card-rate input").forEach((el) => {
+      if (el.classList.contains("card-hz")) return;
+      el.disabled = batchRunning;
+    });
+    const showSave = batchCanSave && !batchRunning && batchSampleTotal() > 0;
+    const dirReady = !!String(exportDirEl?.value || "").trim();
+    const showPost = !batchRunning && dirReady;
+    if (batchSeqWrap) batchSeqWrap.hidden = !(showSave || showPost);
     if (btnBatchSave) {
       btnBatchSave.hidden = !showSave;
       btnBatchSave.disabled = !showSave;
+    }
+    if (btnBatchPost) {
+      btnBatchPost.hidden = !showPost;
+      btnBatchPost.disabled = !showPost;
+    }
+    if (btnLiveStop) btnLiveStop.disabled = !batchRunning;
+    if (liveSeqWrap) liveSeqWrap.hidden = !(showSave || showPost);
+    if (btnLiveSave) {
+      btnLiveSave.hidden = !showSave;
+      btnLiveSave.disabled = !showSave;
+    }
+    if (btnLivePost) {
+      btnLivePost.hidden = !showPost;
+      btnLivePost.disabled = !showPost;
+    }
+    if ((showSave || showPost) && liveSeqEl && batchSeqEl && !liveSeqEl.value) {
+      liveSeqEl.value = batchSeqEl.value || "";
+    }
+  }
+
+  /** @type {Record<string, object>} */
+  let livePayloads = {};
+
+  function isCameraKind(kind) {
+    return kind === "realsense";
+  }
+
+  const CAM_ID_ORDER = ["rs-left", "rs-right", "rs-middle"];
+
+  function sortCameraSessions(sessions) {
+    return sessions
+      .filter((s) => isCameraKind(s.kind))
+      .sort((a, b) => {
+        const ia = CAM_ID_ORDER.indexOf(a.id);
+        const ib = CAM_ID_ORDER.indexOf(b.id);
+        const sa = ia === -1 ? 100 : ia;
+        const sb = ib === -1 ? 100 : ib;
+        if (sa !== sb) return sa - sb;
+        return String(a.id).localeCompare(String(b.id));
+      })
+      .slice(0, 3);
+  }
+
+  function formatDigit(v, digits = 3) {
+    if (v == null || v === "") return "—";
+    const n = Number(v);
+    if (!Number.isFinite(n)) return String(v);
+    if (Math.abs(n) >= 1000) return n.toFixed(0);
+    if (Math.abs(n) >= 100) return n.toFixed(1);
+    if (Math.abs(n) >= 10) return n.toFixed(2);
+    return n.toFixed(digits);
+  }
+
+  function digitsFromPayload(payload) {
+    const kind = payload?.kind || "";
+    const sample = payload?.sample || {};
+    const viz = payload?.viz || {};
+    /** @type {{ label: string, value: string }[]} */
+    const rows = [];
+
+    // Prefer viz charts (dry-run arm/gripper put values here while sample.* is null)
+    for (const ch of viz.charts || []) {
+      if (!ch || typeof ch !== "object") continue;
+      if (ch.type === "bars" && Array.isArray(ch.values) && ch.values.length) {
+        const labels = ch.labels || [];
+        const prefix = String(ch.title || "")
+          .replace(/\s*\([^)]*\)\s*/g, "")
+          .trim()
+          .slice(0, 6);
+        ch.values.forEach((v, i) => {
+          const lab = labels[i] != null && labels[i] !== "" ? String(labels[i]) : `${prefix || "v"}${i + 1}`;
+          rows.push({ label: lab, value: formatDigit(v) });
+        });
+      } else if (ch.type === "gauge" && ch.value != null && Number.isFinite(Number(ch.value))) {
+        const lab = String(ch.title || "val")
+          .replace(/\s*\([^)]*\)\s*/g, "")
+          .trim()
+          .slice(0, 8) || "val";
+        rows.push({ label: lab, value: formatDigit(ch.value) });
+      }
+    }
+    if (rows.length) return rows.slice(0, 18);
+
+    if (kind === "arm" || kind === "gello") {
+      const joints = sample.joints || sample.joints_rad || sample.arm_joints || [];
+      if (Array.isArray(joints) && joints.length) {
+        joints.forEach((v, i) => rows.push({ label: `j${i + 1}`, value: formatDigit(v) }));
+      }
+    } else if (kind === "gripper") {
+      if (sample.position_norm != null) rows.push({ label: "norm", value: formatDigit(sample.position_norm) });
+      if (sample.position_raw != null) rows.push({ label: "raw", value: String(sample.position_raw) });
+      if (sample.grip_detected != null) rows.push({ label: "grip", value: String(sample.grip_detected) });
+      if (sample.init_state != null) rows.push({ label: "init", value: String(sample.init_state) });
+    } else if (kind === "ft") {
+      const force = sample.force || [];
+      const torque = sample.torque || [];
+      ["Fx", "Fy", "Fz"].forEach((lab, i) => {
+        if (force[i] != null) rows.push({ label: lab, value: formatDigit(force[i]) });
+      });
+      ["Tx", "Ty", "Tz"].forEach((lab, i) => {
+        if (torque[i] != null) rows.push({ label: lab, value: formatDigit(torque[i]) });
+      });
+    } else if (kind === "tactile") {
+      const rf = sample.rest_force;
+      if (Array.isArray(rf)) {
+        ["Rx", "Ry", "Rz"].forEach((lab, i) => rows.push({ label: lab, value: formatDigit(rf[i]) }));
+      } else if (rf != null) {
+        rows.push({ label: "rest", value: formatDigit(rf) });
+      }
+      if (sample.contact_force != null) rows.push({ label: "Fz", value: formatDigit(sample.contact_force) });
+    }
+
+    if (!rows.length) {
+      for (const m of viz.metrics || []) {
+        const label = String(m.label || "");
+        if (!label || label === "tick") continue;
+        rows.push({ label, value: String(m.value ?? "—") });
+        if (rows.length >= 12) break;
+      }
+    }
+    return rows.slice(0, 18);
+  }
+
+  function liveStatusText(s) {
+    if (s.rateOk === false) return t("status.rate");
+    if (s.rateOk === true) return "ok";
+    if (batchRunning) return t("live.statusWarm");
+    return deviceCache[s.id]?.status || "—";
+  }
+
+  function liveStatusKind(s) {
+    if (s.rateOk === false) return "rate";
+    if (s.rateOk === true) return "ok";
+    return deviceCache[s.id]?.status || "unknown";
+  }
+
+  function applyLiveGrid2x2() {
+    if (!liveStage) return;
+    liveStage.style.setProperty("--live-cols", "2");
+    liveStage.style.setProperty("--live-rows", "2");
+    liveStage.classList.add("is-2x2");
+  }
+
+  function renderCamTileHtml(s, slot) {
+    if (!s) {
+      return `
+        <article class="live-tile live-cam is-empty" data-slot="${slot}">
+          <div class="live-tile-head">
+            <div>
+              <p class="live-tile-kind">camera · ${slot + 1}</p>
+              <h3>${escapeHtml(t("live.camEmpty"))}</h3>
+            </div>
+          </div>
+          <div class="live-tile-body live-cam-body">
+            <div class="live-cam-placeholder">${escapeHtml(t("live.camEmpty"))}</div>
+          </div>
+        </article>`;
+    }
+    const st = liveStatusKind(s);
+    return `
+      <article class="live-tile live-cam" data-id="${escapeHtml(s.id)}" data-slot="${slot}" data-status="${escapeHtml(st)}">
+        <div class="live-tile-head">
+          <div>
+            <p class="live-tile-kind">${escapeHtml(s.kind)} · ${escapeHtml(s.id)}</p>
+            <h3>${escapeHtml(s.name || s.id)}</h3>
+          </div>
+          <span class="status-pill" data-status="${escapeHtml(st)}">${escapeHtml(liveStatusText(s))}</span>
+        </div>
+        <p class="live-tile-meta">${escapeHtml(
+          t("live.tileMeta", {
+            hz: s.hz,
+            measured: formatMeasured(s.measuredHz),
+            tick: "—",
+          })
+        )}</p>
+        <div class="live-tile-body live-cam-body">
+          <div class="viz-images"></div>
+        </div>
+      </article>`;
+  }
+
+  function renderNumericBlockHtml(s) {
+    const st = liveStatusKind(s);
+    return `
+      <div class="live-num-block" data-id="${escapeHtml(s.id)}" data-status="${escapeHtml(st)}">
+        <div class="live-num-head">
+          <div>
+            <p class="live-num-kind">${escapeHtml(s.kind)} · ${escapeHtml(s.id)}</p>
+            <h4>${escapeHtml(s.name || s.id)}</h4>
+          </div>
+          <span class="status-pill" data-status="${escapeHtml(st)}">${escapeHtml(liveStatusText(s))}</span>
+        </div>
+        <p class="live-tile-meta">${escapeHtml(
+          t("live.tileMeta", {
+            hz: s.hz,
+            measured: formatMeasured(s.measuredHz),
+            tick: "—",
+          })
+        )}</p>
+        <div class="live-num-digits"></div>
+      </div>`;
+  }
+
+  function buildLiveDashboard(sessions, initialPayloads = {}) {
+    if (!liveStage || !liveStatusList) return;
+    livePayloads = { ...initialPayloads };
+    applyLiveGrid2x2();
+    const cams = sortCameraSessions(sessions);
+    const others = sessions.filter((s) => !isCameraKind(s.kind));
+    const camSlots = [cams[0] || null, cams[1] || null, cams[2] || null];
+
+    liveStatusList.innerHTML = sessions
+      .map((s) => {
+        const st = liveStatusKind(s);
+        return `
+          <div class="live-status-item" data-id="${escapeHtml(s.id)}">
+            <p class="name">${escapeHtml(s.name || s.id)}</p>
+            <span class="status-pill" data-status="${escapeHtml(st)}">${escapeHtml(liveStatusText(s))}</span>
+            <p class="sub">${escapeHtml(s.kind)} · ${escapeHtml(s.id)}</p>
+          </div>`;
+      })
+      .join("");
+
+    liveStage.innerHTML = `
+      ${camSlots.map((s, i) => renderCamTileHtml(s, i)).join("")}
+      <article class="live-tile live-numeric" data-slot="3">
+        <div class="live-tile-head">
+          <div>
+            <p class="live-tile-kind">numeric</p>
+            <h3>${escapeHtml(t("live.othersTitle"))}</h3>
+          </div>
+        </div>
+        <div class="live-tile-body">
+          <div class="live-numeric-grid" id="live-numeric-grid">
+            ${
+              others.length
+                ? others.map((s) => renderNumericBlockHtml(s)).join("")
+                : `<p class="live-num-empty">${escapeHtml(t("live.noOthers"))}</p>`
+            }
+          </div>
+        </div>
+      </article>`;
+
+    for (const s of sessions) {
+      const payload = initialPayloads[s.id];
+      if (payload) updateLiveTile(s, payload);
+    }
+    if (liveHint) {
+      liveHint.textContent = t("batch.running", {
+        n: sessions.length,
+        count: batchSampleTotal(),
+        ok: batchRateOkCount(),
+      });
+    }
+  }
+
+  function openLiveDashboard(sessions, initialPayloads = {}) {
+    buildLiveDashboard(sessions, initialPayloads);
+    if (liveModal) liveModal.hidden = false;
+    setBatchUi();
+  }
+
+  function closeLiveDashboard() {
+    if (liveModal) liveModal.hidden = true;
+    if (liveStage) {
+      liveStage.innerHTML = "";
+      liveStage.classList.remove("is-2x2");
+    }
+    if (liveStatusList) liveStatusList.innerHTML = "";
+    if (liveHint) liveHint.textContent = "";
+    livePayloads = {};
+  }
+
+  async function dismissLiveDashboard() {
+    if (batchRunning) await stopBatch({ quiet: true });
+    closeLiveDashboard();
+  }
+
+  function updateLiveStatusItem(s) {
+    const esc = String(s.id).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const statusItem = liveStatusList?.querySelector(`.live-status-item[data-id="${esc}"]`);
+    if (!statusItem) return;
+    const pill = statusItem.querySelector(".status-pill");
+    if (pill) {
+      const st = liveStatusKind(s);
+      pill.dataset.status = st;
+      pill.textContent = liveStatusText(s);
+    }
+  }
+
+  function updateLiveCameraTile(s, payload) {
+    const esc = String(s.id).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const tile = liveStage?.querySelector(`.live-cam[data-id="${esc}"]`);
+    if (!tile) return;
+    const st = liveStatusKind(s);
+    tile.dataset.status = st;
+    const pill = tile.querySelector(".status-pill");
+    if (pill) {
+      pill.dataset.status = st;
+      pill.textContent = liveStatusText(s);
+    }
+    const meta = tile.querySelector(".live-tile-meta");
+    if (meta) {
+      meta.textContent = t("live.tileMeta", {
+        hz: s.hz,
+        measured: formatMeasured(s.measuredHz),
+        tick: payload?.tick ?? "—",
+      });
+    }
+    const images = (payload?.viz?.images || []).slice(0, 1);
+    renderImages(tile.querySelector(".viz-images"), images);
+  }
+
+  function updateLiveNumericBlock(s, payload) {
+    const esc = String(s.id).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const block = liveStage?.querySelector(`.live-num-block[data-id="${esc}"]`);
+    if (!block) return;
+    const st = liveStatusKind(s);
+    block.dataset.status = st;
+    const pill = block.querySelector(".status-pill");
+    if (pill) {
+      pill.dataset.status = st;
+      pill.textContent = liveStatusText(s);
+    }
+    const meta = block.querySelector(".live-tile-meta");
+    if (meta) {
+      meta.textContent = t("live.tileMeta", {
+        hz: s.hz,
+        measured: formatMeasured(s.measuredHz),
+        tick: payload?.tick ?? "—",
+      });
+    }
+    const digits = digitsFromPayload({ ...payload, kind: payload?.kind || s.kind });
+    const digitsEl = block.querySelector(".live-num-digits");
+    if (digitsEl) {
+      digitsEl.innerHTML = digits.length
+        ? digits
+            .map(
+              (d) => `
+            <div class="live-digit">
+              <span class="live-digit-k">${escapeHtml(d.label)}</span>
+              <span class="live-digit-v">${escapeHtml(d.value)}</span>
+            </div>`
+            )
+            .join("")
+        : `<div class="live-digit"><span class="live-digit-k">—</span><span class="live-digit-v">—</span></div>`;
+    }
+  }
+
+  function updateLiveTile(s, payload) {
+    if (payload) livePayloads[s.id] = payload;
+    updateLiveStatusItem(s);
+    if (isCameraKind(s.kind)) {
+      updateLiveCameraTile(s, payload || livePayloads[s.id]);
+    } else {
+      updateLiveNumericBlock(s, payload || livePayloads[s.id]);
+    }
+    if (liveHint && batchRunning) {
+      liveHint.textContent = t("batch.running", {
+        n: batchSessions.length,
+        count: batchSampleTotal(),
+        ok: batchRateOkCount(),
+      });
     }
   }
 
@@ -298,7 +840,56 @@
     return [...selectedIds];
   }
 
+  function cardSelector(id) {
+    return `.card[data-id="${String(id).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"]`;
+  }
+
+  function updateCardRateUi(id, { measured, ok, probeStatus } = {}) {
+    const card = grid?.querySelector(cardSelector(id));
+    if (!card) return;
+    const measuredEl = card.querySelector(".card-rate-measured");
+    if (measuredEl) {
+      measuredEl.textContent =
+        measured == null
+          ? t("card.measuredWarm")
+          : t("card.measured", { hz: formatMeasured(measured) });
+    }
+    const pill = card.querySelector(".status-pill");
+    if (!pill) return;
+    if (ok === false) {
+      pill.dataset.status = "rate";
+      pill.textContent = t("status.rate");
+      card.dataset.status = "rate";
+    } else if (ok === true) {
+      pill.dataset.status = "ok";
+      pill.textContent = "ok";
+      card.dataset.status = "ok";
+    } else if (probeStatus != null) {
+      pill.dataset.status = probeStatus;
+      pill.textContent = probeStatus;
+      card.dataset.status = probeStatus;
+    }
+  }
+
+  function restoreCardProbeStatuses() {
+    for (const d of lastDevices) {
+      updateCardRateUi(d.id, { measured: null, ok: null, probeStatus: d.status });
+      const measuredEl = grid?.querySelector(`${cardSelector(d.id)} .card-rate-measured`);
+      if (measuredEl) measuredEl.textContent = t("card.measuredWarm");
+    }
+  }
+
   function frameReadingFromPayload(payload) {
+    const viz = payload.viz || null;
+    // Keep images (and light charts) so 批后处理 can rebuild hik rgb_*/steps
+    let vizLight = null;
+    if (viz && typeof viz === "object") {
+      vizLight = {
+        images: Array.isArray(viz.images) ? viz.images : [],
+        charts: Array.isArray(viz.charts) ? viz.charts : [],
+        metrics: Array.isArray(viz.metrics) ? viz.metrics : [],
+      };
+    }
     return {
       tick: payload.tick,
       dry_run: !!payload.dry_run,
@@ -308,6 +899,7 @@
       config_used: payload.config_used ?? null,
       kind: payload.kind || null,
       name: payload.name || null,
+      viz: vizLight,
     };
   }
 
@@ -334,59 +926,65 @@
     return data;
   }
 
-  function clearBatchTimer() {
-    if (batchTimer) {
-      clearInterval(batchTimer);
-      batchTimer = null;
+  function clearBatchTimers() {
+    for (const s of batchSessions) {
+      if (s.timer) {
+        clearInterval(s.timer);
+        s.timer = null;
+      }
     }
   }
 
-  async function tickBatchOnce() {
-    if (!batchRunning || batchTickInFlight || !batchSessions.length) return;
-    batchTickInFlight = true;
+  function armBatchSessionTimer(s) {
+    if (s.timer) {
+      clearInterval(s.timer);
+      s.timer = null;
+    }
+    s.timer = setInterval(() => {
+      tickBatchDevice(s).catch(() => {});
+    }, intervalMsForHz(s.hz));
+  }
+
+  async function tickBatchDevice(s) {
+    if (!batchRunning || s.tickInFlight) return;
+    s.tickInFlight = true;
     try {
-      const results = await Promise.all(
-        batchSessions.map(async (s) => {
-          const res = await fetch(`/api/session/${encodeURIComponent(s.sessionId)}/tick`, { method: "POST" });
-          const data = await res.json().catch(() => ({}));
-          if (!res.ok) throw new Error(`${s.id}: ${data.detail || res.status}`);
-          return { id: s.id, data };
-        })
-      );
-      const readings = {};
-      let tick = 0;
-      for (const { id, data } of results) {
-        readings[id] = frameReadingFromPayload(data);
-        tick = Math.max(tick, Number(data.tick) || 0);
-      }
-      batchFrames.push({
+      const res = await fetch(`/api/session/${encodeURIComponent(s.sessionId)}/tick`, { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(`${s.id}: ${data.detail || res.status}`);
+      const reading = frameReadingFromPayload(data);
+      if (!batchStreams[s.id]) batchStreams[s.id] = [];
+      batchStreams[s.id].push({
         t: new Date().toISOString(),
-        tick,
-        readings,
+        ...reading,
       });
-      if (batchHint) {
-        batchHint.textContent = t("batch.running", {
-          n: batchSessions.length,
-          hz: clampBatchHz(batchRateEl?.value),
-          tick,
-          count: batchFrames.length,
-        });
+      s.sampleCount = batchStreams[s.id].length;
+      const evaled = observeRate(s.times, s.hz);
+      s.measuredHz = evaled.measured;
+      s.rateOk = evaled.ok;
+      if (batchMeta[s.id]) {
+        batchMeta[s.id].measuredHz = s.measuredHz;
+        batchMeta[s.id].rateOk = s.rateOk;
+        batchMeta[s.id].hz = s.hz;
       }
+      updateCardRateUi(s.id, { measured: s.measuredHz, ok: s.rateOk });
+      updateLiveTile(s, data);
+      updateBatchHintText();
     } catch (err) {
       if (batchHint) batchHint.textContent = String(err.message || err);
+      if (liveHint) liveHint.textContent = String(err.message || err);
       await stopBatch({ quiet: true });
     } finally {
-      batchTickInFlight = false;
+      s.tickInFlight = false;
     }
   }
 
   async function stopBatch({ quiet = false } = {}) {
-    clearBatchTimer();
+    clearBatchTimers();
     const sessions = batchSessions.slice();
     batchSessions = [];
     batchRunning = false;
-    batchTickInFlight = false;
-    batchCanSave = batchFrames.length > 0;
+    batchCanSave = batchSampleTotal() > 0;
     setBatchUi();
     syncCardSelectionUi();
     await Promise.all(
@@ -398,9 +996,11 @@
         }
       })
     );
-    if (!quiet && batchHint) {
-      batchHint.textContent = t("batch.stopped", { count: batchFrames.length });
-    }
+    restoreCardProbeStatuses();
+    const msg = t("batch.stopped", { count: batchSampleTotal() });
+    if (!quiet && batchHint) batchHint.textContent = msg;
+    if (liveHint) liveHint.textContent = msg;
+    setBatchUi();
   }
 
   async function startBatch() {
@@ -411,7 +1011,8 @@
     }
     if (batchRunning) return;
     await stopStream({ quiet: true });
-    batchFrames = [];
+    batchStreams = {};
+    batchMeta = {};
     batchCanSave = false;
     setBatchUi();
     if (batchHint) batchHint.textContent = t("batch.checking");
@@ -428,26 +1029,46 @@
       }
       if (batchHint) batchHint.textContent = t("batch.starting");
       const started = [];
+      const initialPayloads = {};
       for (const id of ids) {
         try {
           const data = await startBatchSession(id);
-          started.push({
+          const kind = data.kind || deviceCache[id]?.kind || "";
+          const prefs = getRatePrefs(id, kind);
+          const session = {
             id,
             sessionId: data.session_id,
-            kind: data.kind || deviceCache[id]?.kind || "",
+            kind,
             name: data.name || deviceCache[id]?.name || id,
-          });
-          if (!batchFrames.length) {
-            batchFrames.push({
+            hz: prefs.hz,
+            hzMin: prefs.hzMin,
+            hzMax: prefs.hzMax,
+            timer: null,
+            tickInFlight: false,
+            times: [],
+            measuredHz: null,
+            rateOk: null,
+            sampleCount: 0,
+          };
+          batchStreams[id] = [
+            {
               t: new Date().toISOString(),
-              tick: data.tick || 1,
-              readings: { [id]: frameReadingFromPayload(data) },
-            });
-          } else {
-            const first = batchFrames[0];
-            first.readings[id] = frameReadingFromPayload(data);
-            first.tick = Math.max(Number(first.tick) || 0, Number(data.tick) || 0);
-          }
+              ...frameReadingFromPayload(data),
+            },
+          ];
+          session.sampleCount = 1;
+          batchMeta[id] = {
+            hz: session.hz,
+            hzMin: session.hzMin,
+            hzMax: session.hzMax,
+            measuredHz: null,
+            rateOk: null,
+            kind: session.kind,
+            name: session.name,
+          };
+          observeRate(session.times, session.hz);
+          initialPayloads[id] = data;
+          started.push(session);
         } catch (err) {
           for (const s of started) {
             try {
@@ -464,18 +1085,15 @@
       batchStartedAt = Date.now();
       setBatchUi();
       syncCardSelectionUi();
-      if (batchHint) {
-        batchHint.textContent = t("batch.running", {
-          n: batchSessions.length,
-          hz: clampBatchHz(batchRateEl?.value),
-          tick: batchFrames[0]?.tick || 1,
-          count: batchFrames.length,
-        });
+      updateBatchHintText();
+      openLiveDashboard(batchSessions, initialPayloads);
+      for (const s of batchSessions) {
+        updateCardRateUi(s.id, { measured: null, ok: null });
+        armBatchSessionTimer(s);
       }
-      clearBatchTimer();
-      batchTimer = setInterval(tickBatchOnce, batchIntervalMs());
     } catch (err) {
-      batchFrames = [];
+      batchStreams = {};
+      batchMeta = {};
       batchCanSave = false;
       batchRunning = false;
       batchSessions = [];
@@ -486,47 +1104,250 @@
   }
 
   function saveBatchFile() {
-    if (!batchFrames.length) {
-      if (batchHint) batchHint.textContent = t("batch.nothing");
+    const count = batchSampleTotal();
+    if (!count) {
+      const msg = t("batch.nothing");
+      if (batchHint) batchHint.textContent = msg;
+      if (liveHint) liveHint.textContent = msg;
       return;
     }
-    const seq = String(batchSeqEl?.value || "").trim();
+    if (liveSeqEl?.value && batchSeqEl && !String(batchSeqEl.value || "").trim()) {
+      batchSeqEl.value = liveSeqEl.value;
+    }
+    if (batchSeqEl?.value && liveSeqEl && !String(liveSeqEl.value || "").trim()) {
+      liveSeqEl.value = batchSeqEl.value;
+    }
+    const seq = String(liveSeqEl?.value || batchSeqEl?.value || "").trim();
     if (!seq) {
-      if (batchHint) batchHint.textContent = t("batch.needSeq");
-      batchSeqEl?.focus();
+      const msg = t("batch.needSeq");
+      if (batchHint) batchHint.textContent = msg;
+      if (liveHint) liveHint.textContent = msg;
+      (liveSeqEl || batchSeqEl)?.focus();
+      return;
+    }
+    if (batchSeqEl) batchSeqEl.value = seq;
+    if (liveSeqEl) liveSeqEl.value = seq;
+    const dir = String(exportDirEl?.value || "").trim();
+    if (!dir) {
+      const msg = t("batch.needDir");
+      if (batchHint) batchHint.textContent = msg;
+      if (liveHint) liveHint.textContent = msg;
+      exportDirEl?.focus();
       return;
     }
     const safeSeq = seq.replace(/[^\w.\-]+/g, "_");
     const file = `sensors-view-${safeSeq}.json`;
+    const deviceIds = Object.keys(batchStreams);
     const payload = {
       seq,
       saved_at: new Date().toISOString(),
       started_at: batchStartedAt ? new Date(batchStartedAt).toISOString() : null,
-      hz: clampBatchHz(batchRateEl?.value),
       dry_run: !!batchDryRunEl?.checked,
-      device_ids: [...new Set(batchFrames.flatMap((f) => Object.keys(f.readings || {})))],
-      devices: (batchFrames[0]
-        ? Object.keys(batchFrames[0].readings || {})
-        : selectedDeviceIds()
-      ).map((id) => ({
-        id,
-        kind: deviceCache[id]?.kind || batchFrames[0]?.readings?.[id]?.kind || null,
-        name: deviceCache[id]?.name || batchFrames[0]?.readings?.[id]?.name || id,
-      })),
-      count: batchFrames.length,
-      frames: batchFrames,
+      device_ids: deviceIds,
+      devices: deviceIds.map((id) => {
+        const meta = batchMeta[id] || {};
+        const prefs = getRatePrefs(id, meta.kind || deviceCache[id]?.kind || "");
+        return {
+          id,
+          kind: meta.kind || deviceCache[id]?.kind || batchStreams[id]?.[0]?.kind || null,
+          name: meta.name || deviceCache[id]?.name || batchStreams[id]?.[0]?.name || id,
+          hz: meta.hz ?? prefs.hz,
+          hz_min: meta.hzMin ?? prefs.hzMin,
+          hz_max: meta.hzMax ?? prefs.hzMax,
+          measured_hz: meta.measuredHz ?? null,
+          rate_ok: meta.rateOk ?? null,
+        };
+      }),
+      count,
+      streams: JSON.parse(JSON.stringify(batchStreams)),
     };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = file;
-    a.rel = "noopener";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    if (batchHint) batchHint.textContent = t("batch.saved", { count: batchFrames.length, file });
+    const starting = t("batch.saving");
+    if (batchHint) batchHint.textContent = starting;
+    if (liveHint) liveHint.textContent = starting;
+    btnBatchSave.disabled = true;
+    if (btnLiveSave) btnLiveSave.disabled = true;
+    saveJsonToServer(file, payload, dir)
+      .then((res) => {
+        const msg = t("batch.saved", { count, path: res.path || file });
+        if (batchHint) batchHint.textContent = msg;
+        if (liveHint) liveHint.textContent = msg;
+      })
+      .catch((err) => {
+        const msg = t("batch.saveFailed", { err: err.message || err });
+        if (batchHint) batchHint.textContent = msg;
+        if (liveHint) liveHint.textContent = msg;
+      })
+      .finally(() => {
+        setBatchUi();
+      });
+  }
+
+  async function pollExportJob(jobId) {
+    const deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+      const res = await fetch(`/api/export/jobs/${encodeURIComponent(jobId)}`);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(apiDetail(body) || `HTTP ${res.status}`);
+      if (body.status === "done") return body;
+      if (body.status === "error") throw new Error(body.error || "export failed");
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    throw new Error("export timeout");
+  }
+
+  async function saveJsonToServer(filename, data, dir) {
+    const res = await fetch("/api/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename,
+        data,
+        dir: dir || undefined,
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(apiDetail(body) || `HTTP ${res.status}`);
+    if (body.job_id) return pollExportJob(body.job_id);
+    return body;
+  }
+
+  async function pollPostprocessJob(jobId) {
+    const deadline = Date.now() + 600000;
+    while (Date.now() < deadline) {
+      const res = await fetch(`/api/postprocess/jobs/${encodeURIComponent(jobId)}`);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(apiDetail(body) || `HTTP ${res.status}`);
+      if (body.status === "done") return body;
+      if (body.status === "error") throw new Error(body.error || "postprocess failed");
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    throw new Error("postprocess timeout");
+  }
+
+  function runBatchPostprocess() {
+    if (liveSeqEl?.value && batchSeqEl && !String(batchSeqEl.value || "").trim()) {
+      batchSeqEl.value = liveSeqEl.value;
+    }
+    if (batchSeqEl?.value && liveSeqEl && !String(liveSeqEl.value || "").trim()) {
+      liveSeqEl.value = batchSeqEl.value;
+    }
+    const dir = String(exportDirEl?.value || "").trim();
+    if (!dir) {
+      const msg = t("batch.needDir");
+      if (batchHint) batchHint.textContent = msg;
+      if (liveHint) liveHint.textContent = msg;
+      exportDirEl?.focus();
+      return;
+    }
+    const seq = String(liveSeqEl?.value || batchSeqEl?.value || "").trim();
+    const starting = t("batch.posting");
+    if (batchHint) batchHint.textContent = starting;
+    if (liveHint) liveHint.textContent = starting;
+    if (btnBatchPost) btnBatchPost.disabled = true;
+    if (btnLivePost) btnLivePost.disabled = true;
+    fetch("/api/postprocess", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        dir,
+        seq: seq || undefined,
+        interval_ms: 200,
+        write_video: false,
+      }),
+    })
+      .then(async (res) => {
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(apiDetail(body) || `HTTP ${res.status}`);
+        if (body.job_id) return pollPostprocessJob(body.job_id);
+        return body;
+      })
+      .then((res) => {
+        const results = res.results || [];
+        const first = results[0] || {};
+        const msg = t("batch.posted", {
+          n: results.length || 1,
+          frames: first.frames ?? "—",
+          path: first.path || res.out_dir || res.path || dir,
+        });
+        if (batchHint) batchHint.textContent = msg;
+        if (liveHint) liveHint.textContent = msg;
+      })
+      .catch((err) => {
+        const msg = t("batch.postFailed", { err: err.message || err });
+        if (batchHint) batchHint.textContent = msg;
+        if (liveHint) liveHint.textContent = msg;
+      })
+      .finally(() => {
+        setBatchUi();
+      });
+  }
+
+  async function persistExportDir() {
+    if (!exportDirEl) return;
+    const dir = String(exportDirEl.value || "").trim();
+    if (!dir) return;
+    const res = await fetch("/api/export", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dir }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(apiDetail(body) || `HTTP ${res.status}`);
+    if (body.dir) exportDirEl.value = body.dir;
+  }
+
+  function bindCardRateControls(card, d) {
+    const prefs = getRatePrefs(d.id, d.kind);
+    const hzEl = card.querySelector(".card-hz");
+    const minEl = card.querySelector(".card-hz-min");
+    const maxEl = card.querySelector(".card-hz-max");
+    const syncInputs = (p) => {
+      if (hzEl) {
+        hzEl.min = String(p.hzMin);
+        hzEl.max = String(p.hzMax);
+        hzEl.value = String(p.hz);
+      }
+      if (minEl) minEl.value = String(p.hzMin);
+      if (maxEl) maxEl.value = String(p.hzMax);
+    };
+    syncInputs(prefs);
+
+    const apply = (patch) => {
+      const next = setRatePrefs(d.id, d.kind, patch);
+      syncInputs(next);
+      const live = batchSessions.find((s) => s.id === d.id);
+      if (live && patch.hz != null) {
+        live.hz = next.hz;
+        live.times = [];
+        live.measuredHz = null;
+        live.rateOk = null;
+        armBatchSessionTimer(live);
+        updateCardRateUi(d.id, { measured: null, ok: null });
+      }
+      if (currentDevice?.id === d.id) {
+        applyModalRateBounds();
+        if (sessionId) {
+          armStreamTimer();
+          updateStreamStatus();
+        }
+      }
+    };
+
+    hzEl?.addEventListener("change", () => {
+      apply({ hz: clampDeviceHz(hzEl.value, getRatePrefs(d.id, d.kind)) });
+    });
+    minEl?.addEventListener("change", () => {
+      const cur = getRatePrefs(d.id, d.kind);
+      let hzMin = Number(minEl.value);
+      if (!Number.isFinite(hzMin)) hzMin = cur.hzMin;
+      apply({ hzMin, hz: clampDeviceHz(cur.hz, { ...cur, hzMin }) });
+    });
+    maxEl?.addEventListener("change", () => {
+      const cur = getRatePrefs(d.id, d.kind);
+      let hzMax = Number(maxEl.value);
+      if (!Number.isFinite(hzMax)) hzMax = cur.hzMax;
+      apply({ hzMax, hz: clampDeviceHz(cur.hz, { ...cur, hzMax }) });
+    });
   }
 
   function renderCards(devices) {
@@ -535,6 +1356,14 @@
     const known = new Set(lastDevices.map((d) => d.id));
     for (const id of [...selectedIds]) {
       if (!known.has(id)) selectedIds.delete(id);
+    }
+    for (const id of [...selectionSeeded]) {
+      if (!known.has(id)) selectionSeeded.delete(id);
+    }
+    for (const d of lastDevices) {
+      if (selectionSeeded.has(d.id)) continue;
+      selectionSeeded.add(d.id);
+      if (!DEFAULT_UNCHECKED_KINDS.has(d.kind)) selectedIds.add(d.id);
     }
     grid.innerHTML = lastDevices
       .map((d, i) => {
@@ -550,8 +1379,16 @@
           ? t("card.cta.writable")
           : t("card.cta.sample");
         const selected = selectedIds.has(d.id);
+        const prefs = getRatePrefs(d.id, d.kind);
+        const live = batchSessions.find((s) => s.id === d.id);
+        const status = live && live.rateOk === false ? "rate" : live && live.rateOk === true ? "ok" : d.status;
+        const statusText = status === "rate" ? t("status.rate") : status;
+        const measuredText =
+          live && live.measuredHz != null
+            ? t("card.measured", { hz: formatMeasured(live.measuredHz) })
+            : t("card.measuredWarm");
         return `
-          <article class="card clickable${selected ? " is-selected" : ""}" style="animation-delay:${Math.min(i * 0.03, 0.3)}s" data-id="${escapeHtml(d.id)}" data-status="${escapeHtml(d.status)}" tabindex="0" role="button">
+          <article class="card clickable${selected ? " is-selected" : ""}" style="animation-delay:${Math.min(i * 0.03, 0.3)}s" data-id="${escapeHtml(d.id)}" data-status="${escapeHtml(status)}" tabindex="0" role="button">
             <div class="card-head">
               <div>
                 <label class="card-select">
@@ -561,9 +1398,26 @@
                 <p class="card-id">${escapeHtml(d.kind)} · ${escapeHtml(d.id)}</p>
                 <h2 class="card-title">${escapeHtml(d.name || d.id)}</h2>
               </div>
-              <span class="status-pill" data-status="${escapeHtml(d.status)}">${escapeHtml(d.status)}</span>
+              <span class="status-pill" data-status="${escapeHtml(status)}">${escapeHtml(statusText)}</span>
             </div>
             <p class="msg">${escapeHtml(d.message || "")}</p>
+            <div class="card-rate" data-id="${escapeHtml(d.id)}">
+              <label class="field">
+                <span class="field-label">${escapeHtml(t("card.hz"))}</span>
+                <input type="number" class="card-hz" step="${prefs.hzMax >= 100 ? "1" : "0.1"}" value="${prefs.hz}" ${batchRunning && !live ? "disabled" : ""} />
+              </label>
+              <label class="field">
+                <span class="field-label">${escapeHtml(t("card.hzMin"))}</span>
+                <input type="number" class="card-hz-min" step="0.1" value="${prefs.hzMin}" ${batchRunning ? "disabled" : ""} />
+              </label>
+              <label class="field">
+                <span class="field-label">${escapeHtml(t("card.hzMax"))}</span>
+                <input type="number" class="card-hz-max" step="0.1" value="${prefs.hzMax}" ${batchRunning ? "disabled" : ""} />
+              </label>
+              <div class="card-rate-meta">
+                <p class="card-rate-measured">${escapeHtml(measuredText)}</p>
+              </div>
+            </div>
             <ul class="checks">${checks}</ul>
             <div class="card-actions">
               <span class="card-cta">${cta}</span>
@@ -574,13 +1428,16 @@
       .join("");
 
     grid.querySelectorAll(".card").forEach((card) => {
+      const id = card.dataset.id;
+      const d = deviceCache[id];
+      if (d) bindCardRateControls(card, d);
       const open = () => openModal(card.dataset.id);
       card.addEventListener("click", (e) => {
-        if (e.target.closest(".card-select")) return;
+        if (e.target.closest(".card-select") || e.target.closest(".card-rate")) return;
         open();
       });
       card.addEventListener("keydown", (e) => {
-        if (e.target.closest(".card-select")) return;
+        if (e.target.closest(".card-select") || e.target.closest(".card-rate")) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           open();
@@ -589,6 +1446,9 @@
     });
     grid.querySelectorAll(".card-select").forEach((label) => {
       label.addEventListener("click", (e) => e.stopPropagation());
+    });
+    grid.querySelectorAll(".card-rate").forEach((el) => {
+      el.addEventListener("click", (e) => e.stopPropagation());
     });
     grid.querySelectorAll(".card-check").forEach((box) => {
       box.addEventListener("change", () => {
@@ -599,6 +1459,7 @@
       });
     });
     syncCardSelectionUi();
+    setBatchUi();
   }
 
   function fieldValue(cfg, key, asType) {
@@ -966,6 +1827,12 @@
       formHint.textContent = t("stream.nothing");
       return;
     }
+    const dir = String(exportDirEl?.value || "").trim();
+    if (!dir) {
+      formHint.textContent = t("batch.needDir");
+      exportDirEl?.focus();
+      return;
+    }
     const id = currentDevice?.id || "sensor";
     const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const file = `sensors-view-${id}-${stamp}.json`;
@@ -975,22 +1842,30 @@
       kind: currentDevice?.kind || null,
       name: currentDevice?.name || null,
       hz: clampHz(rateEl.value),
+      hz_min: currentDevice ? getRatePrefs(currentDevice.id, currentDevice.kind).hzMin : null,
+      hz_max: currentDevice ? getRatePrefs(currentDevice.id, currentDevice.kind).hzMax : null,
+      measured_hz: streamMeasuredHz,
+      rate_ok: streamRateOk,
       dry_run: !!dryRunEl.checked,
       started_at: streamStartedAt ? new Date(streamStartedAt).toISOString() : null,
       count: streamRecords.length,
       samples: streamRecords,
     };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = file;
-    a.rel = "noopener";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    formHint.textContent = t("stream.saved", { count: streamRecords.length, file });
+    formHint.textContent = t("form.opening");
+    btnSaveStream.disabled = true;
+    saveJsonToServer(file, payload, dir)
+      .then((res) => {
+        formHint.textContent = t("stream.saved", {
+          count: streamRecords.length,
+          path: res.path || file,
+        });
+      })
+      .catch((err) => {
+        formHint.textContent = t("stream.saveFailed", { err: err.message || err });
+      })
+      .finally(() => {
+        updateSaveStreamBtn();
+      });
   }
 
   function showViz(payload) {
@@ -1032,10 +1907,18 @@
     const auto = autoCommandEl.checked ? t("stream.auto") : "";
     streamStatus.textContent = t("stream.running", {
       hz,
+      measured: formatMeasured(streamMeasuredHz),
+      rateStatus: rateStatusLabel(streamRateOk),
       tick: tick ?? "—",
       elapsed,
       auto,
     });
+    if (currentDevice?.id) {
+      updateCardRateUi(currentDevice.id, {
+        measured: streamMeasuredHz,
+        ok: streamRateOk,
+      });
+    }
   }
 
   function clearStreamTimer() {
@@ -1048,10 +1931,18 @@
   async function stopStream({ quiet = false } = {}) {
     clearStreamTimer();
     const sid = sessionId;
+    const prevId = currentDevice?.id;
     sessionId = null;
     streamRecording = false;
+    streamRateTimes = [];
+    streamMeasuredHz = null;
+    streamRateOk = null;
     updateSaveStreamBtn();
     setStreamingUi(false);
+    if (prevId && !batchRunning) {
+      const probe = deviceCache[prevId]?.status;
+      updateCardRateUi(prevId, { measured: null, ok: null, probeStatus: probe });
+    }
     if (!sid) {
       if (!quiet) formHint.textContent = t("form.stopped");
       updateStreamStatus();
@@ -1080,6 +1971,9 @@
       const res = await fetch(`/api/session/${encodeURIComponent(sessionId)}/tick`, { method: "POST" });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      const evaled = observeRate(streamRateTimes, clampHz(rateEl.value));
+      streamMeasuredHz = evaled.measured;
+      streamRateOk = evaled.ok;
       showViz(data);
       updateStreamStatus(data.tick);
     } catch (err) {
@@ -1115,12 +2009,21 @@
       streamStartedAt = Date.now();
       streamRecords = [];
       streamRecording = true;
+      streamRateTimes = [];
+      streamMeasuredHz = null;
+      streamRateOk = null;
+      observeRate(streamRateTimes, clampHz(rateEl.value));
       updateSaveStreamBtn();
       setStreamingUi(true);
       showViz(data);
       updateStreamStatus(data.tick);
       formHint.textContent = t("form.streaming");
       armStreamTimer();
+      if (currentDevice?.id) {
+        const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
+        setRatePrefs(currentDevice.id, currentDevice.kind, { hz: clampHz(rateEl.value) });
+        void prefs;
+      }
     } catch (err) {
       formHint.textContent = String(err.message || err);
       setStreamingUi(false);
@@ -1172,6 +2075,7 @@
       modalTitle.textContent = data.name || data.id;
       modalKind.textContent = `${data.kind} · ${data.id}`;
       dryRunEl.checked = !!data.dry_run_default;
+      applyModalRateBounds();
 
       const fields = data.fields || [];
       if (!fields.length) {
@@ -1196,11 +2100,12 @@
       setStreamingUi(false);
     } catch (err) {
       formHint.textContent = String(err.message || err);
-      currentDevice = { id, fields: [], config: deviceCache[id]?.config || {}, control: { writable: false } };
+      currentDevice = { id, fields: [], config: deviceCache[id]?.config || {}, control: { writable: false }, kind: deviceCache[id]?.kind || "device" };
       modalTitle.textContent = id;
       modalKind.textContent = deviceCache[id]?.kind || "device";
       formFields.innerHTML = "";
       controlPanel.hidden = true;
+      applyModalRateBounds();
     }
   }
 
@@ -1217,6 +2122,10 @@
     setText("meta-count", String(meta.count ?? "—"));
     setText("meta-mode", meta.dry_run ? "dry-run" : "live");
     if (batchDryRunEl && !batchRunning) batchDryRunEl.checked = !!meta.dry_run;
+    if (exportDirEl && meta.export_dir) {
+      exportDirEl.value = meta.export_dir;
+      exportDirEl.placeholder = meta.export_dir_default || meta.export_dir;
+    }
     setText("meta-config", meta.sensors_config || "—");
     return meta;
   }
@@ -1264,7 +2173,15 @@
   btnRandomCmd.addEventListener("click", randomCommandOnce);
   rateEl.addEventListener("change", () => {
     rateEl.value = String(clampHz(rateEl.value));
+    if (currentDevice?.id) {
+      setRatePrefs(currentDevice.id, currentDevice.kind, { hz: clampHz(rateEl.value) });
+      const cardHz = grid?.querySelector(`${cardSelector(currentDevice.id)} .card-hz`);
+      if (cardHz) cardHz.value = rateEl.value;
+    }
     if (sessionId) {
+      streamRateTimes = [];
+      streamMeasuredHz = null;
+      streamRateOk = null;
       armStreamTimer();
       updateStreamStatus();
       formHint.textContent = t("form.rateChanged", { hz: clampHz(rateEl.value) });
@@ -1284,12 +2201,23 @@
     });
   });
   btnBatchSave?.addEventListener("click", saveBatchFile);
-  batchRateEl?.addEventListener("change", () => {
-    if (batchRateEl) batchRateEl.value = String(clampBatchHz(batchRateEl.value));
-    if (batchRunning) {
-      clearBatchTimer();
-      batchTimer = setInterval(tickBatchOnce, batchIntervalMs());
-    }
+  btnBatchPost?.addEventListener("click", runBatchPostprocess);
+  btnLiveStop?.addEventListener("click", () => {
+    stopBatch().catch((err) => {
+      if (liveHint) liveHint.textContent = String(err.message || err);
+    });
+  });
+  btnLiveSave?.addEventListener("click", saveBatchFile);
+  btnLivePost?.addEventListener("click", runBatchPostprocess);
+  btnLiveClose?.addEventListener("click", () => {
+    dismissLiveDashboard().catch((err) => {
+      if (liveHint) liveHint.textContent = String(err.message || err);
+    });
+  });
+  exportDirEl?.addEventListener("change", () => {
+    persistExportDir().catch((err) => {
+      if (batchHint) batchHint.textContent = t("batch.saveFailed", { err: err.message || err });
+    });
   });
   btnLogout?.addEventListener("click", logout);
   btnUsers?.addEventListener("click", () => {
@@ -1391,6 +2319,9 @@
     if (usersModal && !usersModal.hidden) {
       e.preventDefault();
       closeUsersModal();
+    } else if (liveModal && !liveModal.hidden) {
+      e.preventDefault();
+      dismissLiveDashboard().catch(() => {});
     } else if (!modal.hidden) {
       e.preventDefault();
       closeModal();
@@ -1410,14 +2341,9 @@
     updateSaveStreamBtn();
     setBatchUi();
     if (batchRunning && batchHint) {
-      batchHint.textContent = t("batch.running", {
-        n: batchSessions.length,
-        hz: clampBatchHz(batchRateEl?.value),
-        tick: batchFrames[batchFrames.length - 1]?.tick || "—",
-        count: batchFrames.length,
-      });
-    } else if (batchCanSave && batchHint && batchFrames.length) {
-      batchHint.textContent = t("batch.stopped", { count: batchFrames.length });
+      updateBatchHintText();
+    } else if (batchCanSave && batchHint && batchSampleTotal()) {
+      batchHint.textContent = t("batch.stopped", { count: batchSampleTotal() });
     }
     if (!modal.hidden && currentDevice) {
       const writable = control().writable;

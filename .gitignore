@@ -29,3 +29,12 @@ config/.auth.json
 # Linked hik-sensors checkout (sibling repo)
 sensors/
 sensors
+
+# Desktop packaging
+release/
+packaging/dist*/
+packaging/build*/
+.tools/
+.wine-sensors-view/
+*.spec.bak
+/tmp/sensors-view-*-win/
