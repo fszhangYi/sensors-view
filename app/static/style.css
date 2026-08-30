@@ -1082,6 +1082,78 @@ html[lang="en"] .affine-field {
   grid-template-columns: 5.6rem 1fr;
 }
 
+.users-panel {
+  width: min(720px, 100%);
+}
+.users-section {
+  margin-top: 0.85rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--border);
+}
+.users-section h3 {
+  margin: 0 0 0.65rem;
+  font-size: 0.92rem;
+  font-weight: 650;
+}
+.users-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.7rem;
+  align-items: end;
+}
+.users-form .modal-actions {
+  grid-column: 1 / -1;
+}
+.users-form select {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.55rem 0.7rem;
+  font: inherit;
+  background: var(--input-bg);
+  color: var(--text);
+}
+.users-table-wrap {
+  overflow: auto;
+  margin-bottom: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.users-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84rem;
+}
+.users-table th,
+.users-table td {
+  padding: 0.55rem 0.7rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.users-table th {
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: var(--surface-2);
+}
+.users-table tr:last-child td {
+  border-bottom: none;
+}
+.users-table select,
+.users-table input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+.users-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.users-actions .btn {
+  padding: 0.28rem 0.65rem;
+  font-size: 0.74rem;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

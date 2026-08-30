@@ -1,4 +1,4 @@
-"""Cookie session auth for sensors-view (cookie-session-auth port)."""
+"""Cookie session auth for sensors-view (multi-user + password change)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ AUTH_BOOTSTRAP_PATH = ROOT / "config" / ".auth.json"
 COOKIE_NAME = "sensors_view_session"
 SESSION_TTL_SEC = 7 * 24 * 3600
 PBKDF2_ITERATIONS = 120_000
+VALID_ROLES = frozenset({"admin", "user"})
 
 PUBLIC_API_PATHS = frozenset(
     {
@@ -31,11 +32,8 @@ PUBLIC_API_PATHS = frozenset(
 
 _lock = threading.RLock()
 _sessions: dict[str, dict[str, Any]] = {}
-_state: dict[str, Any] = {
-    "enabled": True,
-    "username": "sensors",
-    "password_hash": "",
-}
+_users: list[dict[str, Any]] = []
+_state: dict[str, Any] = {"enabled": True, "username_hint": "sensors"}
 
 
 def _env_truthy(name: str) -> bool:
@@ -67,18 +65,14 @@ def _verify_password(password: str, stored: str) -> bool:
     return secrets.compare_digest(password, stored)
 
 
-def _write_users(username: str, password_hash: str) -> None:
+def _normalize_role(role: str) -> str:
+    r = (role or "user").strip().lower()
+    return r if r in VALID_ROLES else "user"
+
+
+def _save_users_unlocked() -> None:
     USERS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "users": [
-            {
-                "username": username,
-                "role": "admin",
-                "enabled": True,
-                "password_hash": password_hash,
-            }
-        ]
-    }
+    payload = {"version": 1, "users": _users}
     USERS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     try:
         os.chmod(USERS_PATH, 0o600)
@@ -86,68 +80,214 @@ def _write_users(username: str, password_hash: str) -> None:
         pass
 
 
-def _load_primary_user() -> tuple[str, str]:
-    if USERS_PATH.is_file():
-        data = json.loads(USERS_PATH.read_text(encoding="utf-8"))
-        users = data.get("users") if isinstance(data, dict) else None
-        if isinstance(users, list) and users:
-            u = users[0]
-            return str(u.get("username") or "sensors"), str(u.get("password_hash") or "")
-    return "sensors", ""
+def _load_users_file() -> list[dict[str, Any]]:
+    if not USERS_PATH.is_file():
+        return []
+    raw = json.loads(USERS_PATH.read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and isinstance(raw.get("users"), list):
+        return [u for u in raw["users"] if isinstance(u, dict)]
+    if isinstance(raw, list):
+        return [u for u in raw if isinstance(u, dict)]
+    return []
+
+
+def _public_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "username": str(row.get("username") or ""),
+        "role": _normalize_role(str(row.get("role") or "user")),
+        "enabled": bool(row.get("enabled", True)),
+    }
+
+
+def find_user(username: str) -> dict[str, Any] | None:
+    u = (username or "").strip()
+    if not u:
+        return None
+    with _lock:
+        for row in _users:
+            if str(row.get("username") or "") == u:
+                return dict(row)
+    return None
+
+
+def list_users_public() -> list[dict[str, Any]]:
+    with _lock:
+        return [_public_row(u) for u in _users]
+
+
+def is_admin(username: str | None) -> bool:
+    row = find_user(username or "")
+    return bool(row and row.get("enabled", True) and str(row.get("role")) == "admin")
+
+
+def create_user(username: str, password: str, role: str = "user") -> dict[str, Any]:
+    u = (username or "").strip()
+    if not u:
+        raise ValueError("username required")
+    if not password:
+        raise ValueError("password required")
+    if len(u) > 64:
+        raise ValueError("username too long")
+    if len(password) < 4:
+        raise ValueError("password too short")
+    with _lock:
+        if any(str(r.get("username") or "") == u for r in _users):
+            raise ValueError("username already exists")
+        row = {
+            "username": u,
+            "role": _normalize_role(role),
+            "enabled": True,
+            "password_hash": _pbkdf2_hash(password),
+        }
+        _users.append(row)
+        _save_users_unlocked()
+        return _public_row(row)
+
+
+def update_user(
+    username: str,
+    *,
+    role: str | None = None,
+    enabled: bool | None = None,
+    password: str | None = None,
+) -> dict[str, Any]:
+    u = (username or "").strip()
+    with _lock:
+        for i, row in enumerate(_users):
+            if str(row.get("username") or "") != u:
+                continue
+            if role is not None:
+                row["role"] = _normalize_role(role)
+            if enabled is not None:
+                # keep at least one enabled admin
+                if not enabled and str(row.get("role")) == "admin":
+                    admins = [
+                        r
+                        for r in _users
+                        if str(r.get("role")) == "admin" and bool(r.get("enabled", True))
+                    ]
+                    if len(admins) <= 1:
+                        raise ValueError("cannot disable last admin")
+                row["enabled"] = bool(enabled)
+            if password is not None and password != "":
+                if len(password) < 4:
+                    raise ValueError("password too short")
+                row["password_hash"] = _pbkdf2_hash(password)
+            _users[i] = row
+            _save_users_unlocked()
+            return _public_row(row)
+    raise ValueError("user not found")
+
+
+def delete_user(username: str, *, actor: str | None = None) -> None:
+    u = (username or "").strip()
+    if actor and actor == u:
+        raise ValueError("cannot delete yourself")
+    with _lock:
+        before = len(_users)
+        target = next((r for r in _users if str(r.get("username") or "") == u), None)
+        if not target:
+            raise ValueError("user not found")
+        if str(target.get("role")) == "admin":
+            admins = [r for r in _users if str(r.get("role")) == "admin"]
+            if len(admins) <= 1:
+                raise ValueError("cannot delete last admin")
+        _users[:] = [r for r in _users if str(r.get("username") or "") != u]
+        if len(_users) == before:
+            raise ValueError("user not found")
+        if not _users:
+            raise ValueError("cannot delete last user")
+        _save_users_unlocked()
+
+
+def change_own_password(username: str, current_password: str, new_password: str) -> None:
+    row = find_user(username)
+    if not row or not row.get("enabled", True):
+        raise ValueError("user not found")
+    if not _verify_password(current_password or "", str(row.get("password_hash") or "")):
+        raise ValueError("current password incorrect")
+    if not new_password or len(new_password) < 4:
+        raise ValueError("password too short")
+    update_user(username, password=new_password)
 
 
 def init_auth() -> dict[str, Any]:
+    global _users
     with _lock:
         if _env_truthy("SENSORS_VIEW_AUTH_DISABLED"):
-            _state.update(enabled=False, username="", password_hash="")
+            _users = []
+            _state.update(enabled=False, username_hint="")
             return {"enabled": False, "username": None, "source": "disabled"}
 
         user = (os.environ.get("SENSORS_VIEW_AUTH_USER") or "").strip() or "sensors"
         password = (os.environ.get("SENSORS_VIEW_AUTH_PASSWORD") or "").strip()
+        _users = _load_users_file()
         source = "users.json"
 
-        existing_user, existing_hash = _load_primary_user()
-        if existing_hash:
-            if password:
-                # env password upserts primary admin
-                ph = _pbkdf2_hash(password)
-                _write_users(user, ph)
-                _state.update(enabled=True, username=user, password_hash=ph)
-                source = "env"
+        if not _users:
+            if not password:
+                password = secrets.token_urlsafe(12)
+                source = "bootstrap"
             else:
-                _state.update(enabled=True, username=existing_user, password_hash=existing_hash)
-            return {"enabled": True, "username": _state["username"], "source": source}
+                source = "env"
+            row = {
+                "username": user,
+                "role": "admin",
+                "enabled": True,
+                "password_hash": _pbkdf2_hash(password),
+            }
+            _users = [row]
+            _save_users_unlocked()
+            if source == "bootstrap":
+                AUTH_BOOTSTRAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+                AUTH_BOOTSTRAP_PATH.write_text(
+                    json.dumps(
+                        {
+                            "username": user,
+                            "password": password,
+                            "note": "Bootstrap only. Prefer SENSORS_VIEW_AUTH_PASSWORD. Do not commit.",
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                try:
+                    os.chmod(AUTH_BOOTSTRAP_PATH, 0o600)
+                except OSError:
+                    pass
+                print(
+                    f"[auth] created admin in config/users.json (user={user} password={password})",
+                    flush=True,
+                )
+            else:
+                print(f"[auth] created admin via env (user={user})", flush=True)
+        elif password:
+            # upsert env user password / ensure admin exists without wiping others
+            existing = next((r for r in _users if str(r.get("username") or "") == user), None)
+            if existing:
+                existing["password_hash"] = _pbkdf2_hash(password)
+                existing["role"] = "admin"
+                existing["enabled"] = True
+            else:
+                _users.append(
+                    {
+                        "username": user,
+                        "role": "admin",
+                        "enabled": True,
+                        "password_hash": _pbkdf2_hash(password),
+                    }
+                )
+            _save_users_unlocked()
+            source = "env-upsert"
 
-        if not password:
-            password = secrets.token_urlsafe(12)
-            source = "bootstrap"
-        ph = _pbkdf2_hash(password)
-        _write_users(user, ph)
-        AUTH_BOOTSTRAP_PATH.parent.mkdir(parents=True, exist_ok=True)
-        AUTH_BOOTSTRAP_PATH.write_text(
-            json.dumps(
-                {
-                    "username": user,
-                    "password": password,
-                    "password_hash": ph,
-                    "note": "Bootstrap only. Prefer SENSORS_VIEW_AUTH_PASSWORD. Do not commit.",
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
+        hint = next(
+            (str(u.get("username")) for u in _users if str(u.get("role")) == "admin"),
+            str(_users[0].get("username") or user) if _users else user,
         )
-        try:
-            os.chmod(AUTH_BOOTSTRAP_PATH, 0o600)
-        except OSError:
-            pass
-        print(
-            f"[auth] created admin in config/users.json (user={user} password={password})",
-            flush=True,
-        )
-        _state.update(enabled=True, username=user, password_hash=ph)
-        return {"enabled": True, "username": user, "source": source}
+        _state.update(enabled=True, username_hint=hint)
+        return {"enabled": True, "username": hint, "source": source, "count": len(_users)}
 
 
 def auth_enabled() -> bool:
@@ -158,7 +298,7 @@ def public_status() -> dict[str, Any]:
     return {
         "ok": True,
         "authRequired": auth_enabled(),
-        "usernameHint": _state.get("username") if auth_enabled() else None,
+        "usernameHint": _state.get("username_hint") if auth_enabled() else None,
         "loginPath": "/login",
     }
 
@@ -199,11 +339,11 @@ def session_profile(token: str | None) -> dict[str, Any] | None:
         row["expires"] = time.time() + SESSION_TTL_SEC
         return {
             "username": str(row.get("username") or ""),
-            "role": str(row.get("role") or "admin"),
+            "role": str(row.get("role") or "user"),
         }
 
 
-def create_session(username: str, role: str = "admin") -> str:
+def create_session(username: str, role: str = "user") -> str:
     token = secrets.token_urlsafe(32)
     with _lock:
         _sessions[token] = {
@@ -222,6 +362,14 @@ def destroy_session(token: str | None) -> None:
         _sessions.pop(token, None)
 
 
+def destroy_sessions_for_user(username: str) -> None:
+    u = (username or "").strip()
+    with _lock:
+        dead = [k for k, v in _sessions.items() if str(v.get("username") or "") == u]
+        for k in dead:
+            _sessions.pop(k, None)
+
+
 def cookie_header_set(token: str) -> str:
     return f"{COOKIE_NAME}={token}; HttpOnly; Path=/; SameSite=Lax"
 
@@ -236,6 +384,12 @@ def is_authenticated(cookie_header: str | None) -> bool:
     return session_profile(parse_session_cookie(cookie_header)) is not None
 
 
+def current_user(cookie_header: str | None) -> dict[str, Any] | None:
+    if not auth_enabled():
+        return {"username": "anonymous", "role": "admin"}
+    return session_profile(parse_session_cookie(cookie_header))
+
+
 def path_requires_auth(path: str) -> bool:
     if not auth_enabled():
         return False
@@ -248,29 +402,22 @@ def path_requires_auth(path: str) -> bool:
 
 def try_login(username: str, password: str) -> dict[str, Any]:
     if not auth_enabled():
-        return {
-            "ok": True,
-            "authRequired": False,
-            "authenticated": True,
-            "user": None,
-        }
+        return {"ok": True, "authRequired": False, "authenticated": True, "user": None}
     user = (username or "").strip()
-    primary, ph = _state.get("username", ""), _state.get("password_hash", "")
-    # reload hash in case file changed
-    file_user, file_hash = _load_primary_user()
-    if file_hash:
-        primary, ph = file_user, file_hash
-        _state.update(username=primary, password_hash=ph)
-
-    if not user or not _verify_password(password, ph) or user != primary:
+    row = find_user(user)
+    if (
+        not row
+        or not row.get("enabled", True)
+        or not _verify_password(password or "", str(row.get("password_hash") or ""))
+    ):
         return {"ok": False, "error": "invalid credentials", "authRequired": True}
-
-    token = create_session(primary, "admin")
+    role = _normalize_role(str(row.get("role") or "user"))
+    token = create_session(user, role)
     return {
         "ok": True,
         "authRequired": True,
         "authenticated": True,
-        "user": {"username": primary, "role": "admin"},
+        "user": {"username": user, "role": role},
         "_set_cookie": cookie_header_set(token),
     }
 

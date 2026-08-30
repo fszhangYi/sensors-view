@@ -4,6 +4,17 @@
   const btnRefresh = document.getElementById("btn-refresh");
   const btnReload = document.getElementById("btn-reload");
   const btnLogout = document.getElementById("btn-logout");
+  const btnUsers = document.getElementById("btn-users");
+  const usersModal = document.getElementById("users-modal");
+  const usersClose = document.getElementById("users-close");
+  const usersAdmin = document.getElementById("users-admin");
+  const usersTbody = document.getElementById("users-tbody");
+  const usersHint = document.getElementById("users-hint");
+  const passwordForm = document.getElementById("password-form");
+  const passwordHint = document.getElementById("password-hint");
+  const userCreateForm = document.getElementById("user-create-form");
+
+  let currentAuthUser = null;
 
   const modal = document.getElementById("modal");
   const modalTitle = document.getElementById("modal-title");
@@ -78,7 +89,9 @@
         return false;
       }
       document.body.hidden = false;
+      currentAuthUser = me.user || null;
       if (btnLogout) btnLogout.hidden = !me.authRequired;
+      if (btnUsers) btnUsers.hidden = !me.authRequired;
       return true;
     } catch {
       document.body.hidden = false;
@@ -92,6 +105,82 @@
     } finally {
       location.assign("/login?from=/");
     }
+  }
+
+  function apiDetail(data) {
+    if (!data) return "";
+    if (typeof data.detail === "string") return data.detail;
+    if (data.detail?.error) return data.detail.error;
+    if (data.error) return data.error;
+    return JSON.stringify(data.detail || data);
+  }
+
+  async function loadUsers() {
+    if (!usersTbody) return;
+    usersHint.textContent = "";
+    const res = await fetch("/api/users");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      usersHint.textContent = apiDetail(data) || `HTTP ${res.status}`;
+      usersAdmin.hidden = true;
+      return;
+    }
+    usersAdmin.hidden = false;
+    const me = currentAuthUser?.username || "";
+    usersTbody.innerHTML = (data.users || [])
+      .map((u) => {
+        const name = escapeHtml(u.username);
+        const role = u.role === "admin" ? "admin" : "user";
+        return `
+          <tr data-user="${name}">
+            <td class="mono">${name}</td>
+            <td>
+              <select class="user-role" data-user="${name}">
+                <option value="user" ${role === "user" ? "selected" : ""}>user</option>
+                <option value="admin" ${role === "admin" ? "selected" : ""}>admin</option>
+              </select>
+            </td>
+            <td><input type="checkbox" class="user-enabled" data-user="${name}" ${u.enabled ? "checked" : ""} /></td>
+            <td>
+              <div class="users-actions">
+                <button type="button" class="btn ghost user-reset" data-user="${name}">${escapeHtml(t("users.resetPassword"))}</button>
+                <button type="button" class="btn danger user-del" data-user="${name}" ${u.username === me ? "disabled" : ""}>${escapeHtml(t("users.delete"))}</button>
+              </div>
+            </td>
+          </tr>`;
+      })
+      .join("");
+  }
+
+  async function patchUser(username, body) {
+    const res = await fetch(`/api/users/${encodeURIComponent(username)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(apiDetail(data) || `HTTP ${res.status}`);
+    return data;
+  }
+
+  async function openUsersModal() {
+    usersModal.hidden = false;
+    passwordHint.textContent = "";
+    usersHint.textContent = "";
+    passwordForm?.reset();
+    const isAdmin = currentAuthUser?.role === "admin";
+    usersAdmin.hidden = !isAdmin;
+    if (isAdmin) {
+      try {
+        await loadUsers();
+      } catch (err) {
+        usersHint.textContent = String(err.message || err);
+      }
+    }
+  }
+
+  function closeUsersModal() {
+    usersModal.hidden = true;
   }
 
   function setText(id, value) {
@@ -792,12 +881,111 @@
   btnRefresh.addEventListener("click", probe);
   btnReload.addEventListener("click", reloadCfg);
   btnLogout?.addEventListener("click", logout);
+  btnUsers?.addEventListener("click", () => {
+    openUsersModal().catch((err) => {
+      usersHint.textContent = String(err.message || err);
+    });
+  });
+  usersClose?.addEventListener("click", closeUsersModal);
+  usersModal?.addEventListener("click", (e) => {
+    if (e.target === usersModal) closeUsersModal();
+  });
+
+  passwordForm?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    passwordHint.textContent = "";
+    try {
+      const res = await fetch("/api/auth/password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          current_password: document.getElementById("pw-current").value,
+          new_password: document.getElementById("pw-new").value,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(apiDetail(data) || `HTTP ${res.status}`);
+      passwordHint.textContent = t("users.passwordOk");
+      passwordForm.reset();
+    } catch (err) {
+      passwordHint.textContent = String(err.message || err);
+    }
+  });
+
+  userCreateForm?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    usersHint.textContent = "";
+    try {
+      const res = await fetch("/api/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: document.getElementById("user-new-name").value.trim(),
+          password: document.getElementById("user-new-pass").value,
+          role: document.getElementById("user-new-role").value,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(apiDetail(data) || `HTTP ${res.status}`);
+      userCreateForm.reset();
+      usersHint.textContent = t("users.created", { user: data.user?.username || "" });
+      await loadUsers();
+    } catch (err) {
+      usersHint.textContent = String(err.message || err);
+    }
+  });
+
+  usersTbody?.addEventListener("change", async (e) => {
+    const roleEl = e.target.closest(".user-role");
+    const enEl = e.target.closest(".user-enabled");
+    try {
+      if (roleEl) {
+        await patchUser(roleEl.dataset.user, { role: roleEl.value });
+        usersHint.textContent = t("users.updated", { user: roleEl.dataset.user });
+      } else if (enEl) {
+        await patchUser(enEl.dataset.user, { enabled: enEl.checked });
+        usersHint.textContent = t("users.updated", { user: enEl.dataset.user });
+      }
+    } catch (err) {
+      usersHint.textContent = String(err.message || err);
+      await loadUsers();
+    }
+  });
+
+  usersTbody?.addEventListener("click", async (e) => {
+    const resetBtn = e.target.closest(".user-reset");
+    const delBtn = e.target.closest(".user-del");
+    try {
+      if (resetBtn) {
+        const user = resetBtn.dataset.user;
+        const pw = window.prompt(t("users.resetPrompt", { user }), "");
+        if (pw == null || pw === "") return;
+        await patchUser(user, { password: pw });
+        usersHint.textContent = t("users.updated", { user });
+      } else if (delBtn) {
+        const user = delBtn.dataset.user;
+        if (!window.confirm(`${t("users.delete")}: ${user}?`)) return;
+        const res = await fetch(`/api/users/${encodeURIComponent(user)}`, { method: "DELETE" });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(apiDetail(data) || `HTTP ${res.status}`);
+        usersHint.textContent = t("users.deleted", { user });
+        await loadUsers();
+      }
+    } catch (err) {
+      usersHint.textContent = String(err.message || err);
+      await loadUsers();
+    }
+  });
+
   modalClose.addEventListener("click", closeModal);
   modal.addEventListener("click", (e) => {
     if (e.target === modal) closeModal();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !modal.hidden) closeModal();
+    if (e.key === "Escape") {
+      if (!usersModal?.hidden) closeUsersModal();
+      else if (!modal.hidden) closeModal();
+    }
   });
   window.addEventListener("beforeunload", () => {
     if (sessionId) {

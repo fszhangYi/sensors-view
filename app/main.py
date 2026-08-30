@@ -105,6 +105,23 @@ class LoginBody(BaseModel):
     password: str = ""
 
 
+class PasswordChangeBody(BaseModel):
+    current_password: str = ""
+    new_password: str = ""
+
+
+class UserCreateBody(BaseModel):
+    username: str = ""
+    password: str = ""
+    role: str = "user"
+
+
+class UserUpdateBody(BaseModel):
+    role: str | None = None
+    enabled: bool | None = None
+    password: str | None = None
+
+
 @dataclass
 class SampleSession:
     id: str
@@ -519,6 +536,77 @@ def api_auth_logout(request: Request) -> JSONResponse:
     if clear:
         resp.headers.append("Set-Cookie", clear)
     return resp
+
+
+def _require_user(request: Request) -> dict[str, Any]:
+    user = view_auth.current_user(request.headers.get("cookie"))
+    if not user and view_auth.auth_enabled():
+        raise HTTPException(
+            status_code=401,
+            detail={"ok": False, "authRequired": True, "loginPath": "/login", "error": "unauthorized"},
+        )
+    return user or {"username": "anonymous", "role": "admin"}
+
+
+def _require_admin(request: Request) -> dict[str, Any]:
+    user = _require_user(request)
+    if view_auth.auth_enabled() and not view_auth.is_admin(user.get("username")):
+        raise HTTPException(status_code=403, detail="admin required")
+    return user
+
+
+@app.post("/api/auth/password")
+def api_change_password(request: Request, body: PasswordChangeBody) -> dict[str, Any]:
+    user = _require_user(request)
+    try:
+        view_auth.change_own_password(user["username"], body.current_password, body.new_password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True}
+
+
+@app.get("/api/users")
+def api_users_list(request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    return {"ok": True, "users": view_auth.list_users_public()}
+
+
+@app.post("/api/users")
+def api_users_create(request: Request, body: UserCreateBody) -> dict[str, Any]:
+    _require_admin(request)
+    try:
+        row = view_auth.create_user(body.username, body.password, body.role)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "user": row}
+
+
+@app.put("/api/users/{username}")
+def api_users_update(username: str, request: Request, body: UserUpdateBody) -> dict[str, Any]:
+    _require_admin(request)
+    try:
+        row = view_auth.update_user(
+            username,
+            role=body.role,
+            enabled=body.enabled,
+            password=body.password,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if body.password:
+        view_auth.destroy_sessions_for_user(username)
+    return {"ok": True, "user": row}
+
+
+@app.delete("/api/users/{username}")
+def api_users_delete(username: str, request: Request) -> dict[str, Any]:
+    actor = _require_admin(request)
+    try:
+        view_auth.delete_user(username, actor=str(actor.get("username") or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    view_auth.destroy_sessions_for_user(username)
+    return {"ok": True}
 
 
 @app.get("/", response_class=HTMLResponse)

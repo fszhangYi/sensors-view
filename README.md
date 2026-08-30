@@ -34,6 +34,8 @@ python -m app.main --host 0.0.0.0 --port 6008
 
 `config/users.json` 与 `config/.auth.json` 已 gitignore。
 
+登录后顶部可打开「用户」：任意登录用户可改自己的密码；**admin** 可增删改账号、重置密码、启停与改角色。
+
 默认 `dry_run: true`（见 `configs/view.yaml`）。真机探测时改为 `false`，并确保已安装 sensors 可选依赖（serial / zmq / realsense / dynamixel）。
 
 ## API
@@ -44,6 +46,9 @@ python -m app.main --host 0.0.0.0 --port 6008
 | `GET /api/auth/me` | 会话状态（公开） |
 | `POST /api/auth/login` | 登录，Set-Cookie |
 | `POST /api/auth/logout` | 登出 |
+| `POST /api/auth/password` | 修改当前用户密码 |
+| `GET/POST /api/users` | 列出 / 创建用户（admin） |
+| `PUT/DELETE /api/users/{username}` | 更新 / 删除用户（admin） |
 | `GET /api/meta` | site / dry_run / device ids（需登录） |
 | `GET /api/probe` | `SensorManager.probe_all()`（需登录） |
 | `GET /api/read/{id}` | open → read → close |
