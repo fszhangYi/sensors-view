@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title }}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="noise" aria-hidden="true"></div>
+  <header class="top">
+    <div class="brand-block">
+      <p class="brand">sensors-view</p>
+      <h1>现场传感器状态</h1>
+      <p class="lede">可视化 <code>hik-sensors</code> 探针与采样，不改动采集栈本身。</p>
+    </div>
+    <div class="controls">
+      <label class="toggle">
+        <input type="checkbox" id="auto-refresh" checked />
+        <span>自动刷新</span>
+      </label>
+      <button type="button" id="btn-refresh" class="btn primary">立即探测</button>
+      <button type="button" id="btn-reload" class="btn ghost">重载配置</button>
+    </div>
+  </header>
+
+  <section class="meta-bar" id="meta-bar" aria-live="polite">
+    <div class="meta-item"><span class="k">site</span><span class="v" id="meta-site">—</span></div>
+    <div class="meta-item"><span class="k">devices</span><span class="v" id="meta-count">—</span></div>
+    <div class="meta-item"><span class="k">mode</span><span class="v" id="meta-mode">—</span></div>
+    <div class="meta-item grow"><span class="k">config</span><span class="v mono" id="meta-config">{{ sensors_config }}</span></div>
+    <div class="meta-item"><span class="k">updated</span><span class="v" id="meta-updated">—</span></div>
+  </section>
+
+  <main>
+    <div class="summary" id="summary"></div>
+    <div class="grid" id="device-grid" data-refresh="{{ refresh_seconds }}"></div>
+  </main>
+
+  <aside class="drawer" id="drawer" hidden>
+    <div class="drawer-panel">
+      <header class="drawer-head">
+        <div>
+          <p class="brand tiny">sample</p>
+          <h2 id="drawer-title">—</h2>
+        </div>
+        <button type="button" class="btn ghost" id="drawer-close">关闭</button>
+      </header>
+      <pre id="drawer-body" class="sample-out">{}</pre>
+    </div>
+  </aside>
+
+  <footer class="foot">
+    <span>linked SDK: <code>./sensors</code> → hik-sensors</span>
+    <span id="refresh-hint">refresh {{ refresh_seconds }}s</span>
+  </footer>
+
+  <script>
+    window.__VIEW__ = {
+      dryRun: {{ dry_run | tojson }},
+      refreshSeconds: {{ refresh_seconds | int }},
+    };
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

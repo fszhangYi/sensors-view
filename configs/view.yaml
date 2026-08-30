@@ -1,0 +1,5 @@
+# sensors-view runtime — points at linked hik-sensors bundle
+sensors_config: sensors/configs/default.yaml
+dry_run: true
+refresh_seconds: 5
+title: sensors-view
