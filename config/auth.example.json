@@ -1,0 +1,4 @@
+{
+  "username": "sensors",
+  "note": "Copy to users.json via bootstrap, or set SENSORS_VIEW_AUTH_USER / SENSORS_VIEW_AUTH_PASSWORD. Do not commit real passwords."
+}

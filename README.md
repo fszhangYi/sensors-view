@@ -17,10 +17,22 @@ sensors-view/
 cd /root/autodl-tmp/sensors-view
 pip install -e .
 # 或仅装依赖后：
-python -m app.main --host 0.0.0.0 --port 8765
+python -m app.main --host 0.0.0.0 --port 6008
 ```
 
-浏览器打开 `http://<host>:8765`。
+浏览器打开 `http://<host>:6008`（未登录会跳到 `/login`）。
+
+### 登录鉴权
+
+默认开启 Cookie 会话（`sensors_view_session`）。首次启动会在 `config/users.json` 写入管理员；控制台会打印初始密码（或已用环境变量指定）。
+
+| 环境变量 | 作用 |
+|------|------|
+| `SENSORS_VIEW_AUTH_DISABLED=1` | 关闭鉴权 |
+| `SENSORS_VIEW_AUTH_USER` | 用户名（默认 `sensors`） |
+| `SENSORS_VIEW_AUTH_PASSWORD` | 密码（首次/更新写入 users.json） |
+
+`config/users.json` 与 `config/.auth.json` 已 gitignore。
 
 默认 `dry_run: true`（见 `configs/view.yaml`）。真机探测时改为 `false`，并确保已安装 sensors 可选依赖（serial / zmq / realsense / dynamixel）。
 
@@ -28,8 +40,12 @@ python -m app.main --host 0.0.0.0 --port 8765
 
 | 路径 | 说明 |
 |------|------|
-| `GET /api/meta` | site / dry_run / device ids |
-| `GET /api/probe` | `SensorManager.probe_all()` |
+| `GET /login` | Embody 风格登录页 |
+| `GET /api/auth/me` | 会话状态（公开） |
+| `POST /api/auth/login` | 登录，Set-Cookie |
+| `POST /api/auth/logout` | 登出 |
+| `GET /api/meta` | site / dry_run / device ids（需登录） |
+| `GET /api/probe` | `SensorManager.probe_all()`（需登录） |
 | `GET /api/read/{id}` | open → read → close |
 | `POST /api/reload` | 重载 YAML 配置 |
 

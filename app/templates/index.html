@@ -1,29 +1,57 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark" data-theme-pref="dark">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{{ title }}</title>
+  <meta name="color-scheme" content="dark" />
+  <title>sensors-view</title>
+  <script>
+    /* Boot: theme + locale before paint */
+    (function () {
+      try {
+        var t = localStorage.getItem("sensors-view.theme") || "dark";
+        var resolved = t === "light" || t === "dark"
+          ? t
+          : (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+        var root = document.documentElement;
+        root.dataset.theme = resolved;
+        root.dataset.themePref = t === "system" || t === "dark" || t === "light" ? t : "dark";
+        root.style.colorScheme = resolved;
+        var meta = document.querySelector('meta[name="color-scheme"]');
+        if (meta) meta.setAttribute("content", resolved);
+        var loc = localStorage.getItem("sensors-view.locale") || "zh";
+        if (loc !== "zh" && loc !== "en") loc = "zh";
+        root.lang = loc === "zh" ? "zh-CN" : "en";
+      } catch (e) { /* ignore */ }
+    })();
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="icon" href="/static/assets/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/static/style.css?v=12" />
 </head>
-<body>
+<body class="sensors-view-page" data-i18n-title="meta.title" hidden>
   <div class="noise" aria-hidden="true"></div>
   <header class="top">
     <div class="brand-block">
-      <p class="brand">sensors-view</p>
-      <h1>现场传感器状态</h1>
-      <p class="lede">可视化 <code>hik-sensors</code> 探针与采样，不改动采集栈本身。</p>
+      <p class="brand" data-i18n="home.brand">sensors-view</p>
+      <h1 data-i18n="home.title">现场传感器状态</h1>
+      <p class="lede" data-i18n="home.lede">点击卡片配置连接，按设定频率连续采样并在弹窗内可视化。</p>
     </div>
     <div class="controls">
-      <label class="toggle">
-        <input type="checkbox" id="auto-refresh" checked />
-        <span>自动刷新</span>
-      </label>
-      <button type="button" id="btn-refresh" class="btn primary">立即探测</button>
-      <button type="button" id="btn-reload" class="btn ghost">重载配置</button>
+      <div class="theme-seg" id="locale-seg" role="group" data-i18n="locale.aria" data-i18n-attr="aria-label" aria-label="界面语言">
+        <button type="button" data-locale="zh" aria-pressed="true" class="active" data-i18n="locale.zh">中文</button>
+        <button type="button" data-locale="en" aria-pressed="false" data-i18n="locale.en">English</button>
+      </div>
+      <div class="theme-seg" id="theme-seg" role="group" data-i18n="theme.aria" data-i18n-attr="aria-label" aria-label="外观主题">
+        <button type="button" data-theme-pref="system" aria-pressed="false" data-i18n="theme.system">系统</button>
+        <button type="button" data-theme-pref="dark" aria-pressed="true" class="active" data-i18n="theme.dark">深色</button>
+        <button type="button" data-theme-pref="light" aria-pressed="false" data-i18n="theme.light">浅色</button>
+      </div>
+      <button type="button" id="btn-refresh" class="btn primary" data-i18n="btn.probe">探测状态</button>
+      <button type="button" id="btn-reload" class="btn ghost" data-i18n="btn.reload">重载配置</button>
+      <button type="button" id="btn-logout" class="btn ghost" data-i18n="btn.logout">退出</button>
     </div>
   </header>
 
@@ -37,33 +65,90 @@
 
   <main>
     <div class="summary" id="summary"></div>
-    <div class="grid" id="device-grid" data-refresh="{{ refresh_seconds }}"></div>
+    <div class="grid" id="device-grid"></div>
   </main>
 
-  <aside class="drawer" id="drawer" hidden>
-    <div class="drawer-panel">
-      <header class="drawer-head">
+  <aside class="modal" id="modal" hidden>
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <header class="modal-head">
         <div>
-          <p class="brand tiny">sample</p>
-          <h2 id="drawer-title">—</h2>
+          <p class="brand tiny" id="modal-kind">device</p>
+          <h2 id="modal-title">—</h2>
         </div>
-        <button type="button" class="btn ghost" id="drawer-close">关闭</button>
+        <button type="button" class="btn ghost" id="modal-close" data-i18n="btn.close">关闭</button>
       </header>
-      <pre id="drawer-body" class="sample-out">{}</pre>
+
+      <form id="connect-form" class="connect-form" autocomplete="off">
+        <div class="form-grid" id="form-fields"></div>
+
+        <div class="stream-row">
+          <label class="field rate-field">
+            <span class="field-label" data-i18n="field.sampleRate">采样频率 Hz</span>
+            <input id="sample-rate" type="number" min="0.2" max="30" step="0.1" value="2" />
+          </label>
+          <label class="toggle block">
+            <input type="checkbox" id="sample-dry-run" {% if dry_run %}checked{% endif %} />
+            <span data-i18n="field.dryRun">dry-run（不连真机）</span>
+          </label>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn primary" id="btn-start" data-i18n="btn.start">开始连续采样</button>
+          <button type="button" class="btn danger" id="btn-stop" disabled data-i18n="btn.stop">停止</button>
+          <button type="button" class="btn ghost" id="btn-once" data-i18n="btn.once">单次采样</button>
+          <span class="form-hint" id="form-hint"></span>
+        </div>
+      </form>
+
+      <section class="control-panel" id="control-panel" hidden>
+        <div class="preview-head">
+          <p class="brand tiny" data-i18n="control.kicker">command · linear map</p>
+          <p class="msg" id="control-hint" data-i18n="control.hint.joints">显示 = rs·生数据 + ro；真实下发 = ws·显示 + wo（scale/offset 为浮点，scale 可为负）</p>
+        </div>
+        <div class="baseline-row">
+          <button type="button" class="btn ghost" id="btn-capture" data-i18n="btn.capture">从最新采样捕获显示基准</button>
+          <span class="form-hint" id="baseline-hint" data-i18n="control.baselineNone">尚未捕获</span>
+        </div>
+        <div class="delta-grid" id="delta-grid"></div>
+        <div class="modal-actions">
+          <button type="button" class="btn primary" id="btn-random-cmd" data-i18n="btn.randomCmd">随机下发一次</button>
+          <label class="toggle block">
+            <input type="checkbox" id="auto-command" />
+            <span data-i18n="control.autoCmd">随连续采样自动随机下发</span>
+          </label>
+          <span class="form-hint" id="command-hint"></span>
+        </div>
+      </section>
+
+      <div class="modal-preview" id="modal-preview" hidden>
+        <div class="preview-head">
+          <p class="brand tiny" data-i18n="viz.kicker">visualization</p>
+          <p class="msg" id="viz-note"></p>
+          <p class="stream-status" id="stream-status"></p>
+        </div>
+        <div class="viz-metrics" id="modal-metrics"></div>
+        <div class="viz-images" id="modal-images"></div>
+        <div class="viz-charts" id="modal-charts"></div>
+        <details class="viz-raw">
+          <summary data-i18n="viz.rawJson">原始 JSON</summary>
+          <pre id="viz-json" class="sample-out light">{}</pre>
+        </details>
+      </div>
     </div>
   </aside>
 
   <footer class="foot">
-    <span>linked SDK: <code>./sensors</code> → hik-sensors</span>
-    <span id="refresh-hint">refresh {{ refresh_seconds }}s</span>
+    <span data-i18n="foot.sdk">linked SDK: ./sensors → hik-sensors</span>
+    <span data-i18n="foot.stream">连续采样 · 可调频率</span>
   </footer>
 
   <script>
     window.__VIEW__ = {
       dryRun: {{ dry_run | tojson }},
-      refreshSeconds: {{ refresh_seconds | int }},
     };
   </script>
-  <script src="/static/app.js"></script>
+  <script src="/static/i18n.js?v=12"></script>
+  <script src="/static/appearance.js?v=12"></script>
+  <script src="/static/app.js?v=12"></script>
 </body>
 </html>
