@@ -449,6 +449,73 @@ main {
   border-color: transparent;
 }
 
+.batch-bar {
+  margin: 0 0 1rem;
+  padding: 0.85rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+}
+.batch-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.75rem 1rem;
+}
+.batch-controls .field {
+  margin: 0;
+  min-width: 7rem;
+}
+.batch-controls .rate-field input {
+  width: 6.5rem;
+}
+.batch-seq-field input {
+  width: 8rem;
+  font-family: var(--mono);
+}
+.batch-controls .form-hint {
+  flex: 1 1 12rem;
+  min-width: 10rem;
+}
+.card-select {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0;
+  cursor: pointer;
+  user-select: none;
+}
+.card-select input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.card-select-label {
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.card.is-selected {
+  border-color: rgba(61, 214, 198, 0.55);
+  box-shadow: 0 0 0 1px rgba(61, 214, 198, 0.2);
+}
+.card.is-batch-live::after {
+  content: "";
+  position: absolute;
+  top: 0.65rem;
+  right: 0.65rem;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-dim);
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
@@ -586,16 +653,17 @@ main {
   letter-spacing: 0.04em;
 }
 
-/* Modal */
+/* Modal — scrim is visual only; dismiss via close button / Escape */
 .modal {
   position: fixed;
   inset: 0;
   z-index: 30;
   background: var(--overlay-scrim);
   backdrop-filter: blur(6px);
-  display: grid;
-  place-items: center;
-  padding: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(1rem, 4vw, 2.5rem);
   animation: fade var(--motion-fast) ease;
 }
 .modal[hidden] {
@@ -691,11 +759,18 @@ main {
   margin-top: 0.2rem;
 }
 .stream-status {
-  margin: 0.25rem 0 0;
+  margin: 0;
   font-family: var(--mono);
   font-size: 0.72rem;
   color: var(--spark);
   letter-spacing: 0.04em;
+}
+.stream-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+  margin-top: 0.35rem;
 }
 .stream-row {
   display: flex;

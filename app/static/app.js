@@ -28,6 +28,15 @@
   const btnStart = document.getElementById("btn-start");
   const btnStop = document.getElementById("btn-stop");
   const btnOnce = document.getElementById("btn-once");
+  const btnSaveStream = document.getElementById("btn-save-stream");
+  const batchRateEl = document.getElementById("batch-rate");
+  const batchDryRunEl = document.getElementById("batch-dry-run");
+  const btnBatchStart = document.getElementById("btn-batch-start");
+  const btnBatchStop = document.getElementById("btn-batch-stop");
+  const btnBatchSave = document.getElementById("btn-batch-save");
+  const batchSeqEl = document.getElementById("batch-seq");
+  const batchSeqWrap = document.getElementById("batch-seq-wrap");
+  const batchHint = document.getElementById("batch-hint");
   const modalPreview = document.getElementById("modal-preview");
   const vizNote = document.getElementById("viz-note");
   const vizJson = document.getElementById("viz-json");
@@ -49,9 +58,21 @@
   let tickInFlight = false;
   let streamStartedAt = 0;
   let lastPayload = null;
+  let streamRecords = [];
+  let streamRecording = false;
   let baseline = null; // number[]
   let lastDevices = [];
   const deviceCache = {};
+  const selectedIds = new Set();
+  let batchRunning = false;
+  let batchTimer = null;
+  let batchTickInFlight = false;
+  let batchStartedAt = 0;
+  /** @type {{ id: string, sessionId: string, kind: string, name: string }[]} */
+  let batchSessions = [];
+  /** @type {object[]} */
+  let batchFrames = [];
+  let batchCanSave = false;
 
   const _fetch = window.fetch.bind(window);
   window.fetch = async (input, init = {}) => {
@@ -231,9 +252,290 @@
       .join("");
   }
 
+  function clampBatchHz(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return 2;
+    return Math.min(30, Math.max(0.2, n));
+  }
+
+  function batchIntervalMs() {
+    return Math.round(1000 / clampBatchHz(batchRateEl?.value));
+  }
+
+  function isOnlineStatus(status) {
+    return status === "ok" || status === "warn";
+  }
+
+  function setBatchUi() {
+    if (!btnBatchStart) return;
+    btnBatchStart.disabled = batchRunning;
+    btnBatchStop.disabled = !batchRunning;
+    if (batchRateEl) batchRateEl.disabled = batchRunning;
+    if (batchDryRunEl) batchDryRunEl.disabled = batchRunning;
+    grid?.querySelectorAll(".card-check").forEach((el) => {
+      el.disabled = batchRunning;
+    });
+    const showSave = batchCanSave && !batchRunning && batchFrames.length > 0;
+    if (batchSeqWrap) batchSeqWrap.hidden = !showSave;
+    if (btnBatchSave) {
+      btnBatchSave.hidden = !showSave;
+      btnBatchSave.disabled = !showSave;
+    }
+  }
+
+  function syncCardSelectionUi() {
+    grid?.querySelectorAll(".card").forEach((card) => {
+      const id = card.dataset.id;
+      const on = selectedIds.has(id);
+      card.classList.toggle("is-selected", on);
+      card.classList.toggle("is-batch-live", batchRunning && batchSessions.some((s) => s.id === id));
+      const box = card.querySelector(".card-check");
+      if (box) box.checked = on;
+    });
+  }
+
+  function selectedDeviceIds() {
+    return [...selectedIds];
+  }
+
+  function frameReadingFromPayload(payload) {
+    return {
+      tick: payload.tick,
+      dry_run: !!payload.dry_run,
+      sample: payload.sample ?? null,
+      raw: extractRawFromPayload(payload),
+      display: extractDisplayFromPayload(payload),
+      config_used: payload.config_used ?? null,
+      kind: payload.kind || null,
+      name: payload.name || null,
+    };
+  }
+
+  async function probeOne(id) {
+    const res = await fetch(`/api/probe?id=${encodeURIComponent(id)}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `probe ${res.status}`);
+    const d = (data.devices || [])[0];
+    if (!d) throw new Error(`no probe result for ${id}`);
+    return d;
+  }
+
+  async function startBatchSession(id) {
+    const res = await fetch(`/api/session/start/${encodeURIComponent(id)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        config: {},
+        dry_run: !!batchDryRunEl?.checked,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : data.detail?.error || `HTTP ${res.status}`);
+    return data;
+  }
+
+  function clearBatchTimer() {
+    if (batchTimer) {
+      clearInterval(batchTimer);
+      batchTimer = null;
+    }
+  }
+
+  async function tickBatchOnce() {
+    if (!batchRunning || batchTickInFlight || !batchSessions.length) return;
+    batchTickInFlight = true;
+    try {
+      const results = await Promise.all(
+        batchSessions.map(async (s) => {
+          const res = await fetch(`/api/session/${encodeURIComponent(s.sessionId)}/tick`, { method: "POST" });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(`${s.id}: ${data.detail || res.status}`);
+          return { id: s.id, data };
+        })
+      );
+      const readings = {};
+      let tick = 0;
+      for (const { id, data } of results) {
+        readings[id] = frameReadingFromPayload(data);
+        tick = Math.max(tick, Number(data.tick) || 0);
+      }
+      batchFrames.push({
+        t: new Date().toISOString(),
+        tick,
+        readings,
+      });
+      if (batchHint) {
+        batchHint.textContent = t("batch.running", {
+          n: batchSessions.length,
+          hz: clampBatchHz(batchRateEl?.value),
+          tick,
+          count: batchFrames.length,
+        });
+      }
+    } catch (err) {
+      if (batchHint) batchHint.textContent = String(err.message || err);
+      await stopBatch({ quiet: true });
+    } finally {
+      batchTickInFlight = false;
+    }
+  }
+
+  async function stopBatch({ quiet = false } = {}) {
+    clearBatchTimer();
+    const sessions = batchSessions.slice();
+    batchSessions = [];
+    batchRunning = false;
+    batchTickInFlight = false;
+    batchCanSave = batchFrames.length > 0;
+    setBatchUi();
+    syncCardSelectionUi();
+    await Promise.all(
+      sessions.map(async (s) => {
+        try {
+          await fetch(`/api/session/${encodeURIComponent(s.sessionId)}/stop`, { method: "POST" });
+        } catch {
+          /* ignore */
+        }
+      })
+    );
+    if (!quiet && batchHint) {
+      batchHint.textContent = t("batch.stopped", { count: batchFrames.length });
+    }
+  }
+
+  async function startBatch() {
+    const ids = selectedDeviceIds();
+    if (!ids.length) {
+      if (batchHint) batchHint.textContent = t("batch.none");
+      return;
+    }
+    if (batchRunning) return;
+    await stopStream({ quiet: true });
+    batchFrames = [];
+    batchCanSave = false;
+    setBatchUi();
+    if (batchHint) batchHint.textContent = t("batch.checking");
+    btnBatchStart.disabled = true;
+    try {
+      for (const id of ids) {
+        if (batchHint) batchHint.textContent = `${t("batch.checking")} ${id}`;
+        const d = await probeOne(id);
+        deviceCache[id] = { ...deviceCache[id], ...d };
+        const dry = !!batchDryRunEl?.checked;
+        if (!dry && !isOnlineStatus(d.status)) {
+          throw new Error(t("batch.offline", { id, status: d.status || "unknown" }));
+        }
+      }
+      if (batchHint) batchHint.textContent = t("batch.starting");
+      const started = [];
+      for (const id of ids) {
+        try {
+          const data = await startBatchSession(id);
+          started.push({
+            id,
+            sessionId: data.session_id,
+            kind: data.kind || deviceCache[id]?.kind || "",
+            name: data.name || deviceCache[id]?.name || id,
+          });
+          if (!batchFrames.length) {
+            batchFrames.push({
+              t: new Date().toISOString(),
+              tick: data.tick || 1,
+              readings: { [id]: frameReadingFromPayload(data) },
+            });
+          } else {
+            const first = batchFrames[0];
+            first.readings[id] = frameReadingFromPayload(data);
+            first.tick = Math.max(Number(first.tick) || 0, Number(data.tick) || 0);
+          }
+        } catch (err) {
+          for (const s of started) {
+            try {
+              await fetch(`/api/session/${encodeURIComponent(s.sessionId)}/stop`, { method: "POST" });
+            } catch {
+              /* ignore */
+            }
+          }
+          throw new Error(t("batch.startFailed", { id, err: err.message || err }));
+        }
+      }
+      batchSessions = started;
+      batchRunning = true;
+      batchStartedAt = Date.now();
+      setBatchUi();
+      syncCardSelectionUi();
+      if (batchHint) {
+        batchHint.textContent = t("batch.running", {
+          n: batchSessions.length,
+          hz: clampBatchHz(batchRateEl?.value),
+          tick: batchFrames[0]?.tick || 1,
+          count: batchFrames.length,
+        });
+      }
+      clearBatchTimer();
+      batchTimer = setInterval(tickBatchOnce, batchIntervalMs());
+    } catch (err) {
+      batchFrames = [];
+      batchCanSave = false;
+      batchRunning = false;
+      batchSessions = [];
+      setBatchUi();
+      syncCardSelectionUi();
+      if (batchHint) batchHint.textContent = String(err.message || err);
+    }
+  }
+
+  function saveBatchFile() {
+    if (!batchFrames.length) {
+      if (batchHint) batchHint.textContent = t("batch.nothing");
+      return;
+    }
+    const seq = String(batchSeqEl?.value || "").trim();
+    if (!seq) {
+      if (batchHint) batchHint.textContent = t("batch.needSeq");
+      batchSeqEl?.focus();
+      return;
+    }
+    const safeSeq = seq.replace(/[^\w.\-]+/g, "_");
+    const file = `sensors-view-${safeSeq}.json`;
+    const payload = {
+      seq,
+      saved_at: new Date().toISOString(),
+      started_at: batchStartedAt ? new Date(batchStartedAt).toISOString() : null,
+      hz: clampBatchHz(batchRateEl?.value),
+      dry_run: !!batchDryRunEl?.checked,
+      device_ids: [...new Set(batchFrames.flatMap((f) => Object.keys(f.readings || {})))],
+      devices: (batchFrames[0]
+        ? Object.keys(batchFrames[0].readings || {})
+        : selectedDeviceIds()
+      ).map((id) => ({
+        id,
+        kind: deviceCache[id]?.kind || batchFrames[0]?.readings?.[id]?.kind || null,
+        name: deviceCache[id]?.name || batchFrames[0]?.readings?.[id]?.name || id,
+      })),
+      count: batchFrames.length,
+      frames: batchFrames,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = file;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    if (batchHint) batchHint.textContent = t("batch.saved", { count: batchFrames.length, file });
+  }
+
   function renderCards(devices) {
     lastDevices = devices || [];
     for (const d of lastDevices) deviceCache[d.id] = d;
+    const known = new Set(lastDevices.map((d) => d.id));
+    for (const id of [...selectedIds]) {
+      if (!known.has(id)) selectedIds.delete(id);
+    }
     grid.innerHTML = lastDevices
       .map((d, i) => {
         const checks = (d.checks || [])
@@ -247,10 +549,15 @@
         const cta = d.kind === "arm" || d.kind === "gripper"
           ? t("card.cta.writable")
           : t("card.cta.sample");
+        const selected = selectedIds.has(d.id);
         return `
-          <article class="card clickable" style="animation-delay:${Math.min(i * 0.03, 0.3)}s" data-id="${escapeHtml(d.id)}" data-status="${escapeHtml(d.status)}" tabindex="0" role="button">
+          <article class="card clickable${selected ? " is-selected" : ""}" style="animation-delay:${Math.min(i * 0.03, 0.3)}s" data-id="${escapeHtml(d.id)}" data-status="${escapeHtml(d.status)}" tabindex="0" role="button">
             <div class="card-head">
               <div>
+                <label class="card-select">
+                  <input type="checkbox" class="card-check" data-id="${escapeHtml(d.id)}" ${selected ? "checked" : ""} ${batchRunning ? "disabled" : ""} />
+                  <span class="card-select-label">${escapeHtml(t("card.select"))}</span>
+                </label>
                 <p class="card-id">${escapeHtml(d.kind)} · ${escapeHtml(d.id)}</p>
                 <h2 class="card-title">${escapeHtml(d.name || d.id)}</h2>
               </div>
@@ -268,14 +575,30 @@
 
     grid.querySelectorAll(".card").forEach((card) => {
       const open = () => openModal(card.dataset.id);
-      card.addEventListener("click", open);
+      card.addEventListener("click", (e) => {
+        if (e.target.closest(".card-select")) return;
+        open();
+      });
       card.addEventListener("keydown", (e) => {
+        if (e.target.closest(".card-select")) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           open();
         }
       });
     });
+    grid.querySelectorAll(".card-select").forEach((label) => {
+      label.addEventListener("click", (e) => e.stopPropagation());
+    });
+    grid.querySelectorAll(".card-check").forEach((box) => {
+      box.addEventListener("change", () => {
+        const id = box.dataset.id;
+        if (box.checked) selectedIds.add(id);
+        else selectedIds.delete(id);
+        syncCardSelectionUi();
+      });
+    });
+    syncCardSelectionUi();
   }
 
   function fieldValue(cfg, key, asType) {
@@ -610,8 +933,69 @@
     }
   }
 
+  function updateSaveStreamBtn() {
+    if (!btnSaveStream) return;
+    const n = streamRecords.length;
+    btnSaveStream.disabled = n === 0;
+    btnSaveStream.textContent = n
+      ? `${t("btn.saveStream")} (${n})`
+      : t("btn.saveStream");
+  }
+
+  function recordStreamSample(payload) {
+    streamRecords.push({
+      t: new Date().toISOString(),
+      tick: payload.tick ?? streamRecords.length,
+      dry_run: !!payload.dry_run,
+      sample: payload.sample ?? null,
+      raw: extractRawFromPayload(payload),
+      display: extractDisplayFromPayload(payload),
+      config_used: payload.config_used ?? null,
+    });
+    updateSaveStreamBtn();
+  }
+
+  function clearStreamRecords() {
+    streamRecords = [];
+    streamRecording = false;
+    updateSaveStreamBtn();
+  }
+
+  function saveStreamFile() {
+    if (!streamRecords.length) {
+      formHint.textContent = t("stream.nothing");
+      return;
+    }
+    const id = currentDevice?.id || "sensor";
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const file = `sensors-view-${id}-${stamp}.json`;
+    const payload = {
+      saved_at: new Date().toISOString(),
+      device_id: currentDevice?.id || null,
+      kind: currentDevice?.kind || null,
+      name: currentDevice?.name || null,
+      hz: clampHz(rateEl.value),
+      dry_run: !!dryRunEl.checked,
+      started_at: streamStartedAt ? new Date(streamStartedAt).toISOString() : null,
+      count: streamRecords.length,
+      samples: streamRecords,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = file;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    formHint.textContent = t("stream.saved", { count: streamRecords.length, file });
+  }
+
   function showViz(payload) {
     lastPayload = payload;
+    if (streamRecording) recordStreamSample(payload);
     const viz = remappedViz(payload);
     modalPreview.hidden = false;
     vizNote.textContent = viz.note || (payload.dry_run ? t("viz.noteDry") : t("viz.noteLive"));
@@ -665,6 +1049,8 @@
     clearStreamTimer();
     const sid = sessionId;
     sessionId = null;
+    streamRecording = false;
+    updateSaveStreamBtn();
     setStreamingUi(false);
     if (!sid) {
       if (!quiet) formHint.textContent = t("form.stopped");
@@ -711,6 +1097,7 @@
 
   async function startStream() {
     if (!currentDevice?.id || sessionId) return;
+    await stopBatch({ quiet: true });
     formHint.textContent = t("form.opening");
     btnStart.disabled = true;
     try {
@@ -726,6 +1113,9 @@
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       sessionId = data.session_id;
       streamStartedAt = Date.now();
+      streamRecords = [];
+      streamRecording = true;
+      updateSaveStreamBtn();
       setStreamingUi(true);
       showViz(data);
       updateStreamStatus(data.tick);
@@ -770,6 +1160,7 @@
     modalPreview.hidden = true;
     streamStatus.textContent = "";
     lastPayload = null;
+    clearStreamRecords();
     baseline = null;
     commandHint.textContent = "";
     baselineHint.textContent = t("control.baselineNone");
@@ -814,8 +1205,8 @@
   }
 
   async function closeModal() {
-    await stopStream({ quiet: true });
     modal.hidden = true;
+    await stopStream({ quiet: true });
   }
 
   async function loadMeta() {
@@ -825,6 +1216,7 @@
     setText("meta-site", meta.site || "—");
     setText("meta-count", String(meta.count ?? "—"));
     setText("meta-mode", meta.dry_run ? "dry-run" : "live");
+    if (batchDryRunEl && !batchRunning) batchDryRunEl.checked = !!meta.dry_run;
     setText("meta-config", meta.sensors_config || "—");
     return meta;
   }
@@ -867,6 +1259,7 @@
   btnStart.addEventListener("click", startStream);
   btnStop.addEventListener("click", () => stopStream());
   btnOnce.addEventListener("click", sampleOnce);
+  btnSaveStream?.addEventListener("click", saveStreamFile);
   btnCapture.addEventListener("click", captureBaseline);
   btnRandomCmd.addEventListener("click", randomCommandOnce);
   rateEl.addEventListener("change", () => {
@@ -880,6 +1273,24 @@
 
   btnRefresh.addEventListener("click", probe);
   btnReload.addEventListener("click", reloadCfg);
+  btnBatchStart?.addEventListener("click", () => {
+    startBatch().catch((err) => {
+      if (batchHint) batchHint.textContent = String(err.message || err);
+    });
+  });
+  btnBatchStop?.addEventListener("click", () => {
+    stopBatch().catch((err) => {
+      if (batchHint) batchHint.textContent = String(err.message || err);
+    });
+  });
+  btnBatchSave?.addEventListener("click", saveBatchFile);
+  batchRateEl?.addEventListener("change", () => {
+    if (batchRateEl) batchRateEl.value = String(clampBatchHz(batchRateEl.value));
+    if (batchRunning) {
+      clearBatchTimer();
+      batchTimer = setInterval(tickBatchOnce, batchIntervalMs());
+    }
+  });
   btnLogout?.addEventListener("click", logout);
   btnUsers?.addEventListener("click", () => {
     openUsersModal().catch((err) => {
@@ -887,9 +1298,6 @@
     });
   });
   usersClose?.addEventListener("click", closeUsersModal);
-  usersModal?.addEventListener("click", (e) => {
-    if (e.target === usersModal) closeUsersModal();
-  });
 
   passwordForm?.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -978,23 +1386,39 @@
   });
 
   modalClose.addEventListener("click", closeModal);
-  modal.addEventListener("click", (e) => {
-    if (e.target === modal) closeModal();
-  });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      if (!usersModal?.hidden) closeUsersModal();
-      else if (!modal.hidden) closeModal();
+    if (e.key !== "Escape") return;
+    if (usersModal && !usersModal.hidden) {
+      e.preventDefault();
+      closeUsersModal();
+    } else if (!modal.hidden) {
+      e.preventDefault();
+      closeModal();
     }
   });
   window.addEventListener("beforeunload", () => {
     if (sessionId) {
       navigator.sendBeacon?.(`/api/session/${encodeURIComponent(sessionId)}/stop`);
     }
+    for (const s of batchSessions) {
+      navigator.sendBeacon?.(`/api/session/${encodeURIComponent(s.sessionId)}/stop`);
+    }
   });
 
   window.SensorsI18n?.onLocaleChange?.(() => {
     if (lastDevices.length) renderCards(lastDevices);
+    updateSaveStreamBtn();
+    setBatchUi();
+    if (batchRunning && batchHint) {
+      batchHint.textContent = t("batch.running", {
+        n: batchSessions.length,
+        hz: clampBatchHz(batchRateEl?.value),
+        tick: batchFrames[batchFrames.length - 1]?.tick || "—",
+        count: batchFrames.length,
+      });
+    } else if (batchCanSave && batchHint && batchFrames.length) {
+      batchHint.textContent = t("batch.stopped", { count: batchFrames.length });
+    }
     if (!modal.hidden && currentDevice) {
       const writable = control().writable;
       if (writable) showControlPanel();
@@ -1004,7 +1428,10 @@
           ? t("control.baselineCaptured", { vals: baseline.map((v) => v.toFixed(3)).join(", ") })
           : t("control.baselineNone");
       } else if (lastPayload) {
+        const wasRecording = streamRecording;
+        streamRecording = false;
         showViz(lastPayload);
+        streamRecording = wasRecording;
         updateStreamStatus();
       }
       formFields.querySelectorAll(".field").forEach((labelEl) => {
