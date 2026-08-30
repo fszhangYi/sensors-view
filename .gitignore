@@ -25,3 +25,7 @@ venv/
 .env
 config/users.json
 config/.auth.json
+
+# Linked hik-sensors checkout (sibling repo)
+sensors/
+sensors
