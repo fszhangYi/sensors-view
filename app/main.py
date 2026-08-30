@@ -78,7 +78,13 @@ CONNECT_FIELDS: dict[str, list[dict[str, Any]]] = {
         {"key": "endpoint", "label": "端点", "type": "text"},
         {"key": "backend", "label": "后端 stub", "type": "text"},
     ],
-    "tactile": [],
+    "tactile": [
+        {"key": "dll_path", "label": "DLL 路径 (ReadPaxiniLib)", "type": "text"},
+        {"key": "paxini_channel", "label": "Paxini 通道", "type": "number"},
+        {"key": "port", "label": "串口 (可选)", "type": "text"},
+        {"key": "group_index", "label": "力组索引", "type": "number"},
+        {"key": "dry_run_groups", "label": "dry-run 组数", "type": "number"},
+    ],
 }
 
 app = FastAPI(title="sensors-view", version="0.1.0")
@@ -225,6 +231,28 @@ def _synthetic_color(width: int = 320, height: int = 180, tick: int = 0) -> np.n
     x0 = 16 + int(phase * max(width - 48, 1))
     img[12:18, x0 : min(width - 16, x0 + 28), :] = (140, 90, 30)
     return img
+
+
+def _tactile_z_heatmap(component_forces: Any, grid_hw: tuple[int, int] = (6, 10)) -> np.ndarray | None:
+    """Build an upscaled Z-channel heatmap (H×W×3 BGR) from 60×3 component forces."""
+    try:
+        arr = np.asarray(component_forces, dtype=np.float64)
+    except Exception:  # noqa: BLE001
+        return None
+    if arr.ndim != 2 or arr.shape[0] < grid_hw[0] * grid_hw[1] or arr.shape[1] < 3:
+        return None
+    z = arr[: grid_hw[0] * grid_hw[1], 2].reshape(grid_hw)
+    zmax = float(np.max(np.abs(z))) or 1.0
+    norm = np.clip(z / zmax, 0.0, 1.0)
+    # teal→spark style ramp without depending on CSS
+    h, w = grid_hw
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    rgb[:, :, 0] = (20 + 40 * (1.0 - norm)).astype(np.uint8)  # B
+    rgb[:, :, 1] = (80 + 150 * norm).astype(np.uint8)  # G
+    rgb[:, :, 2] = (40 + 200 * norm).astype(np.uint8)  # R
+    # nearest upscale for card preview
+    scale = 24
+    return np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
 
 
 def _build_viz(kind: str, sample: dict[str, Any], *, dry_run: bool, tick: int = 0) -> dict[str, Any]:
@@ -380,9 +408,72 @@ def _build_viz(kind: str, sample: dict[str, Any], *, dry_run: bool, tick: int = 
         elif dry_run:
             viz["note"] = viz.get("note") or "六维力无数据"
 
+    elif kind == "tactile":
+        rest = sample.get("rest_force")
+        contact = sample.get("contact_force")
+        comps = sample.get("component_forces")
+        num = int(sample.get("num") or 0)
+        if rest is None and dry_run:
+            rest = [
+                0.12 * math.sin(t * 0.9),
+                0.10 * math.cos(t * 1.1),
+                max(0.05, 0.8 + 0.6 * math.sin(t * 0.65)),
+            ]
+            contact = rest[2]
+            viz["note"] = "dry-run 帕西尼触觉 (rest_force + 6×10 分力)"
+        if isinstance(rest, list) and len(rest) >= 3:
+            viz["charts"].append(
+                {
+                    "type": "bars",
+                    "title": "合力 rest_force (N)",
+                    "labels": ["Rx", "Ry", "Rz"],
+                    "values": [float(x) for x in rest[:3]],
+                }
+            )
+            cf = float(contact) if contact is not None else float(rest[2])
+            viz["charts"].append(
+                {
+                    "type": "gauge",
+                    "title": "接触力 get_force() ≡ Rz",
+                    "value": cf,
+                    "min": 0.0,
+                    "max": max(cf * 1.4, 2.0),
+                }
+            )
+            heat = _tactile_z_heatmap(comps)
+            if heat is not None:
+                b64 = _encode_image_b64(heat)
+                if b64:
+                    viz["images"].append({"title": "分力 Z · 6×10", "src": b64})
+            groups = sample.get("groups") or []
+            viz["metrics"].extend(
+                [
+                    {"label": "num", "value": str(num or len(groups) or 1)},
+                    {"label": "group", "value": str(sample.get("group_index", 0))},
+                    {"label": "Rz", "value": f"{float(rest[2]):.4f}"},
+                    {"label": "contact", "value": f"{cf:.4f}"},
+                    {"label": "grid", "value": str(sample.get("grid_shape") or [6, 10, 3])},
+                    {"label": "channel", "value": str(sample.get("paxini_channel", "—"))},
+                ]
+            )
+            if len(groups) > 1:
+                viz["charts"].append(
+                    {
+                        "type": "bars",
+                        "title": "各组 Rz",
+                        "labels": [f"g{i}" for i in range(len(groups))],
+                        "values": [
+                            float((g.get("rest_force") or [0, 0, 0])[2]) if isinstance(g, dict) else 0.0
+                            for g in groups
+                        ],
+                    }
+                )
+        elif dry_run:
+            viz["note"] = viz.get("note") or "帕西尼触觉无数据"
+
     else:
         for k, v in sample.items():
-            if k in ("color", "depth", "ts"):
+            if k in ("color", "depth", "ts", "groups", "component_forces", "original_forces"):
                 continue
             if isinstance(v, (str, int, float, bool)) or v is None:
                 viz["metrics"].append({"label": k, "value": str(v)})
