@@ -131,10 +131,13 @@ def build_windows(*, skip_frontend: bool = True) -> Path:
 
     req = _linux_to_wine_path(ROOT / "requirements.txt")
     req_d = _linux_to_wine_path(ROOT / "requirements-desktop.txt")
+    req_h = _linux_to_wine_path(ROOT / "requirements-hardware.txt")
     _run([wine, py_wine, "-m", "pip", "install", "-i", PIP_INDEX, "-r", req], env=env)
     _run([wine, py_wine, "-m", "pip", "install", "-i", PIP_INDEX, "-r", req_d], env=env)
+    _run([wine, py_wine, "-m", "pip", "install", "-i", PIP_INDEX, "-r", req_h], env=env)
     # Force numpy pin for Wine 6
     _run([wine, py_wine, "-m", "pip", "install", "-i", PIP_INDEX, "numpy==1.23.5"], env=env)
+    _verify_hardware_imports([wine, py_wine], env=env)
 
     dist = Path("/tmp/sensors-view-dist-win")
     work = Path("/tmp/sensors-view-work-win")
@@ -198,6 +201,8 @@ def build_windows(*, skip_frontend: bool = True) -> Path:
                 "   or watch the console line [auth] created admin ...",
                 "6. Optional: set SENSORS_VIEW_AUTH_PASSWORD before launch",
                 "7. Default dry_run=true; edit configs\\view.yaml under AppData after first run",
+                "8. Hardware SDKs bundled: pyrealsense2, dynamixel-sdk, pyserial, pyzmq",
+                "   (RealSense still needs vendor USB driver on the Windows host)",
                 "",
             ]
         ),
@@ -305,6 +310,18 @@ def _platform_tag() -> str:
     return f"linux-{machine}"
 
 
+def _verify_hardware_imports(py_cmd: list[str], *, env: dict | None = None) -> None:
+    """Fail the build early if hardware SDKs are not importable in the build env."""
+    code = (
+        "import importlib.util as u;"
+        "mods=['pyrealsense2','dynamixel_sdk','serial','zmq'];"
+        "missing=[m for m in mods if u.find_spec(m) is None];"
+        "import sys;"
+        "sys.exit('missing '+str(missing)) if missing else print('hardware_ok', mods)"
+    )
+    _run([*py_cmd, "-c", code], env=env)
+
+
 def _numpy_spec_for(py: str) -> str:
     """Wine builds need 1.23.5; native Linux follows the interpreter's wheels."""
     out = subprocess.check_output([py, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"], text=True)
@@ -352,6 +369,10 @@ def build_native(*, skip_frontend: bool = True) -> Path:
             numpy_spec,
         ]
     )
+    _run([*pip, "install", "-i", PIP_INDEX, "-r", str(ROOT / "requirements-hardware.txt")])
+    # Keep numpy compatible with this interpreter after hardware install
+    _run([*pip, "install", "-i", PIP_INDEX, numpy_spec])
+    _verify_hardware_imports([py])
     dist = Path("/tmp/sensors-view-dist-linux")
     work = Path("/tmp/sensors-view-work-linux")
     for d in (dist, work):
@@ -421,6 +442,8 @@ def build_native(*, skip_frontend: bool = True) -> Path:
                 "6. Optional: SENSORS_VIEW_AUTH_PASSWORD / SENSORS_VIEW_PORT before launch",
                 "7. Without DISPLAY / pywebview, falls back to system browser; Ctrl+C stops",
                 "8. Default dry_run=true; edit configs/view.yaml under the data dir after first run",
+                "9. Hardware SDKs bundled: pyrealsense2, dynamixel-sdk, pyserial, pyzmq",
+                "   (udev rules / vendor drivers may still be required on the host)",
                 "",
             ]
         ),

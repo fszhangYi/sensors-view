@@ -36,7 +36,10 @@ python -m app.main --host 0.0.0.0 --port 6008
 
 登录后顶部可打开「用户」：任意登录用户可改自己的密码；**admin** 可增删改账号、重置密码、启停与改角色。
 
-默认 `dry_run: true`（见 `configs/view.yaml`）。真机探测时改为 `false`，并确保已安装 sensors 可选依赖（serial / zmq / realsense / dynamixel）。
+默认 `dry_run: true`（见 `configs/view.yaml`）。真机探测时改为 `false`。
+
+桌面打包会通过 `requirements-hardware.txt` 打入 `pyrealsense2` / `dynamixel-sdk` / `pyserial` / `pyzmq`；
+开发态也可：`pip install -r requirements-hardware.txt`（或 `pip install 'hik-sensors[realsense,dynamixel,serial,zmq]'`）。
 
 ## API
 

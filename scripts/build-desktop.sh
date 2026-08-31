@@ -48,8 +48,11 @@ Output (windows):
   release/sensors-view-desktop-windows-x64-<UTC>.zip
 
 Prerequisites:
-  native/linux: python3, venv, curl (PyInstaller installed into .tools/linux-venv)
-  windows:      wine64 (or wine), curl, unzip, python3
+  native/linux: python3, venv, curl (deps → .tools/linux-venv; includes hardware SDKs)
+  windows:      wine64 (or wine), curl, unzip, python3 (hardware SDKs via Wine embed Python)
+
+Hardware (bundled into desktop builds via requirements-hardware.txt):
+  pyrealsense2, dynamixel-sdk, pyserial, pyzmq
 EOF
 }
 

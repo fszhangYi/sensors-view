@@ -2,11 +2,14 @@
 """Windows / Wine onedir spec for sensors-view."""
 
 from pathlib import Path
+import sys
 
 from PyInstaller.utils.hooks import collect_submodules
 
 # SPECPATH = directory containing this .spec (PyInstaller injects it)
 ROOT = Path(SPECPATH).resolve().parent  # noqa: F821
+sys.path.insert(0, str(ROOT / "packaging"))
+from hardware_bundle import extend_analysis  # noqa: E402
 
 APP = ROOT / "app"
 SENSORS_SRC = (ROOT / "sensors" / "src").resolve()
@@ -21,6 +24,7 @@ datas = [
     (str(APP / "templates"), "app/templates"),
     (str(ROOT / "configs"), "configs"),
 ]
+binaries: list = []
 if SENSORS_SRC.is_dir():
     datas.append((str(SENSORS_SRC / "sensors"), "sensors_src/sensors"))
 if SENSORS_CFG.is_dir():
@@ -58,6 +62,7 @@ hiddenimports = [
     "app.auth",
     "app.paths",
     "app.desktop_main",
+    "app.postprocess",
     "sensors",
     "sensors.core",
     "sensors.core.base",
@@ -70,11 +75,12 @@ hiddenimports = [
     "sensors.drivers",
 ]
 hiddenimports += collect_submodules("sensors.drivers")
+datas, binaries, hiddenimports = extend_analysis(datas, binaries, hiddenimports)
 
 a = Analysis(
     [str(APP / "desktop_main.py")],
     pathex=[str(ROOT), str(SENSORS_SRC) if SENSORS_SRC.is_dir() else str(ROOT)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
