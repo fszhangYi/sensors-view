@@ -266,19 +266,201 @@ def _postprocess_windows(built: Path, py_dir: Path) -> None:
                     dst.writestr(name, src.read(name))
 
 
-def build_native() -> Path:
-    raise SystemExit("Use scheme-a-linux-to-linux-desktop / --target native later; this script focuses on windows")
+def _ensure_linux_venv(tools: Path) -> Path:
+    venv = tools / "linux-venv"
+    py = venv / "bin" / "python"
+    if py.is_file():
+        return venv
+    tools.mkdir(parents=True, exist_ok=True)
+    # Prefer 3.10 when ensurepip/venv is available; else fall back to current interpreter
+    creators: list[str] = []
+    for cand in ("python3.10", "python3.11", sys.executable, "python3"):
+        path = cand if "/" in cand else shutil.which(cand)
+        if path and path not in creators:
+            creators.append(path)
+    if not creators:
+        raise SystemExit("python3 not found for Linux venv")
+    last_err: Exception | None = None
+    for creator in creators:
+        try:
+            if venv.exists():
+                shutil.rmtree(venv)
+            _run([creator, "-m", "venv", str(venv)])
+            if (venv / "bin" / "python").is_file():
+                print(f"[linux-venv] created with {creator}", flush=True)
+                return venv
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            print(f"[linux-venv] skip {creator}: {exc}", flush=True)
+            continue
+    raise SystemExit(f"failed to create linux venv: {last_err}")
+
+
+def _platform_tag() -> str:
+    machine = os.uname().machine.lower()
+    if machine in {"x86_64", "amd64"}:
+        return "linux-x64"
+    if machine in {"aarch64", "arm64"}:
+        return "linux-arm64"
+    return f"linux-{machine}"
+
+
+def _numpy_spec_for(py: str) -> str:
+    """Wine builds need 1.23.5; native Linux follows the interpreter's wheels."""
+    out = subprocess.check_output([py, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"], text=True)
+    major_minor = out.strip()
+    major, minor = (int(x) for x in major_minor.split("."))
+    if (major, minor) <= (3, 10):
+        return "numpy==1.23.5"
+    # 1.23.5 has no cp312 wheels and fails to build from sdist on 3.12
+    return "numpy>=1.26.4,<2"
+
+
+def build_native(*, skip_frontend: bool = True) -> Path:
+    del skip_frontend  # sensors-view UI is Jinja/static; stub frontend-dist is enough
+    tools = ROOT / ".tools"
+    venv = _ensure_linux_venv(tools)
+    py = str(venv / "bin" / "python")
+    pip = [py, "-m", "pip"]
+    numpy_spec = _numpy_spec_for(py)
+
+    _run([*pip, "install", "-U", "pip", "setuptools", "wheel", "-i", PIP_INDEX])
+    # Install app deps without the Windows/Wine numpy pin when on newer Python
+    _run(
+        [
+            *pip,
+            "install",
+            "-i",
+            PIP_INDEX,
+            "fastapi>=0.110",
+            "uvicorn[standard]>=0.27",
+            "jinja2>=3.1",
+            "PyYAML>=6.0",
+            "Pillow>=10.0",
+            numpy_spec,
+        ]
+    )
+    _run(
+        [
+            *pip,
+            "install",
+            "-i",
+            PIP_INDEX,
+            "pyinstaller>=6.3",
+            "pywebview>=5.0",
+            "Pillow>=10.0",
+            numpy_spec,
+        ]
+    )
+    dist = Path("/tmp/sensors-view-dist-linux")
+    work = Path("/tmp/sensors-view-work-linux")
+    for d in (dist, work):
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
+
+    spec = ROOT / "packaging" / "sensors-view-desktop.spec"
+    if not spec.is_file():
+        raise SystemExit(f"missing spec: {spec}")
+
+    _run(
+        [
+            py,
+            "-m",
+            "PyInstaller",
+            "--noconfirm",
+            "--clean",
+            "--distpath",
+            str(dist),
+            "--workpath",
+            str(work),
+            str(spec),
+        ]
+    )
+
+    built = dist / APP_EXE
+    if not built.is_dir():
+        raise SystemExit(f"PyInstaller output missing: {built}")
+    entry = built / APP_EXE
+    if not entry.is_file():
+        raise SystemExit(f"missing binary: {entry}")
+    entry.chmod(entry.stat().st_mode | 0o111)
+
+    stamp = _utc_stamp()
+    plat = _platform_tag()
+    release = ROOT / "release" / f"{APP_ID}-desktop-{plat}-{stamp}"
+    if release.exists():
+        shutil.rmtree(release)
+    shutil.copytree(built, release)
+
+    info = {
+        "app_id": APP_ID,
+        "product": APP_ID,
+        "kind": "desktop",
+        "platform": plat,
+        "self_contained": True,
+        "requires_python_on_target": False,
+        "built_at": stamp,
+        "built_at_utc": stamp,
+        "entry": APP_EXE,
+        "notes": "Built on Linux via native PyInstaller onedir",
+    }
+    (release / "BUILD_INFO.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+    (release / "README.txt").write_text(
+        "\n".join(
+            [
+                "sensors-view desktop (Linux)",
+                "",
+                "1. Extract this folder",
+                "2. Run: ./sensors-view",
+                "3. No need to install Python / Node",
+                "4. User data: ~/.local/share/sensors-view/",
+                "5. Login: username sensors; first-run password is random",
+                "   → see console [auth] created admin ...",
+                "   → or ~/.local/share/sensors-view/config/.auth.json",
+                "6. Optional: SENSORS_VIEW_AUTH_PASSWORD / SENSORS_VIEW_PORT before launch",
+                "7. Without DISPLAY / pywebview, falls back to system browser; Ctrl+C stops",
+                "8. Default dry_run=true; edit configs/view.yaml under the data dir after first run",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    tar_path = release.with_suffix(".tar.gz")
+    if tar_path.exists():
+        tar_path.unlink()
+    _run(["tar", "-C", str(release.parent), "-czf", str(tar_path), release.name])
+
+    zip_path = Path(str(release) + ".zip")
+    if zip_path.exists():
+        zip_path.unlink()
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in release.rglob("*"):
+            if path.is_file():
+                zf.write(path, arcname=str(path.relative_to(release.parent)))
+
+    print(f"release: {release}")
+    print(f"tar.gz: {tar_path}")
+    print(f"zip: {zip_path}")
+    return release
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--target", choices=["windows", "native"], default="windows")
+    parser = argparse.ArgumentParser(description="Build sensors-view desktop packages")
+    parser.add_argument(
+        "--target",
+        choices=["windows", "native", "linux"],
+        default="windows",
+        help="windows = Wine cross-build; native/linux = current Linux host",
+    )
     parser.add_argument("--skip-frontend", action="store_true", default=True)
     args = parser.parse_args()
-    if args.target == "windows":
+    target = "native" if args.target == "linux" else args.target
+    if target == "windows":
         build_windows(skip_frontend=args.skip_frontend)
     else:
-        build_native()
+        build_native(skip_frontend=args.skip_frontend)
 
 
 if __name__ == "__main__":

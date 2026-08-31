@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Linux → Windows desktop onedir (Wine + embeddable CPython + PyInstaller).
-# See: autodl-tmp/office_skills/scheme-a-linux-to-windows-desktop
+# Desktop packaging entry for sensors-view.
+#   Linux host → Linux onedir:  scheme-a-linux-to-linux-desktop
+#   Linux host → Windows onedir: scheme-a-linux-to-windows-desktop
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,7 +12,7 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEARCH="${WINEARCH:-win64}"
 export WINEPREFIX="${WINEPREFIX:-$ROOT/.wine-sensors-view}"
 
-TARGET="windows"
+TARGET="native"
 SKIP_FRONTEND=1
 EXTRA=()
 
@@ -19,25 +20,36 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/build-desktop.sh [options]
 
-Build a self-contained Windows x64 desktop package under release/.
+Build a self-contained desktop onedir under release/.
 
 Options:
-  --target windows|native   Build target (default: windows)
-  --skip-frontend           Skip frontend build (default, sensors-view is server-rendered)
-  --with-frontend           Pass through if a frontend step is added later
-  -h, --help                Show this help
+  --target native|linux|windows   Build target (default: native = Linux)
+  --skip-frontend                 Skip frontend build (default)
+  --with-frontend                 Reserved if a Vite frontend is added later
+  -h, --help                      Show this help
 
 Environment:
   PIP_INDEX_URL   pip mirror (default: Tsinghua)
-  WINEPREFIX      Wine prefix (default: .wine-sensors-view)
+  WINEPREFIX      Wine prefix for --target windows (default: .wine-sensors-view)
   WINEARCH        win64
 
-Output:
+Examples:
+  ./build.sh                      # Linux x64 package
+  ./build.sh --target windows     # Windows x64 via Wine
+  bash scripts/build-desktop.sh --target native
+
+Output (native/linux):
+  release/sensors-view-desktop-linux-x64-<UTC>/
+  release/sensors-view-desktop-linux-x64-<UTC>.tar.gz
+  release/sensors-view-desktop-linux-x64-<UTC>.zip
+
+Output (windows):
   release/sensors-view-desktop-windows-x64-<UTC>/
   release/sensors-view-desktop-windows-x64-<UTC>.zip
 
 Prerequisites:
-  wine64 (or wine), curl, unzip, python3
+  native/linux: python3, venv, curl (PyInstaller installed into .tools/linux-venv)
+  windows:      wine64 (or wine), curl, unzip, python3
 EOF
 }
 
@@ -66,14 +78,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if ! command -v wine64 >/dev/null 2>&1 && ! command -v wine >/dev/null 2>&1; then
-  echo "error: wine64/wine not found — install Wine (win64) first" >&2
-  exit 1
+if [[ "$TARGET" == "linux" ]]; then
+  TARGET="native"
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "error: python3 not found" >&2
   exit 1
+fi
+
+if [[ "$TARGET" == "windows" ]]; then
+  if ! command -v wine64 >/dev/null 2>&1 && ! command -v wine >/dev/null 2>&1; then
+    echo "error: wine64/wine not found — install Wine (win64) first" >&2
+    exit 1
+  fi
 fi
 
 ARGS=(--target "$TARGET")
@@ -88,7 +106,9 @@ echo "==> sensors-view desktop build"
 echo "    root:      $ROOT"
 echo "    target:    $TARGET"
 echo "    pip index: $PIP_INDEX_URL"
-echo "    wineprefix:$WINEPREFIX"
+if [[ "$TARGET" == "windows" ]]; then
+  echo "    wineprefix:$WINEPREFIX"
+fi
 echo
 
 exec python3 "$ROOT/scripts/build_desktop.py" "${ARGS[@]}"
