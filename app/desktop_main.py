@@ -36,9 +36,61 @@ def _wait_health(url: str, timeout: float = 30.0) -> bool:
     return False
 
 
+def _start_webview(url: str) -> bool:
+    """Open pywebview; return False to fall back to the system browser."""
+    try:
+        import webview  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sensors-view] pywebview unavailable ({exc}); falling back to browser")
+        return False
+
+    from app.paths import APP_TITLE, user_data_dir
+
+    storage = user_data_dir() / "webview"
+    storage.mkdir(parents=True, exist_ok=True)
+
+    # Dark boot color avoids a white flash before CSS paints (common on Windows WebView2).
+    window_kwargs: dict = {
+        "title": APP_TITLE,
+        "url": url,
+        "width": 1280,
+        "height": 860,
+        "background_color": "#0B1018",
+        "text_select": True,
+    }
+    start_kwargs: dict = {
+        "private_mode": False,
+        "storage_path": str(storage),
+    }
+
+    gui = (os.environ.get("SENSORS_VIEW_WEBVIEW_GUI") or "").strip().lower()
+    if not gui and sys.platform == "win32":
+        # Prefer Edge Chromium; legacy MSHTML often shows a blank white page.
+        gui = "edgechromium"
+    if gui:
+        start_kwargs["gui"] = gui
+
+    try:
+        webview.create_window(**window_kwargs)
+        webview.start(**start_kwargs)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sensors-view] webview start failed ({exc}); falling back to browser")
+        if start_kwargs.get("gui"):
+            try:
+                start_kwargs.pop("gui", None)
+                # Recreate: previous create_window may have partially registered
+                webview.create_window(**window_kwargs)
+                webview.start(**start_kwargs)
+                return True
+            except Exception as exc2:  # noqa: BLE001
+                print(f"[sensors-view] webview retry failed ({exc2})")
+        return False
+
+
 def main() -> None:
     # 1) env before importing settings / app
-    from app.paths import APP_TITLE, ensure_runtime_env, default_view_config
+    from app.paths import ensure_runtime_env, default_view_config
 
     ensure_runtime_env(desktop=True)
 
@@ -66,15 +118,15 @@ def main() -> None:
         sys.exit(1)
 
     print(f"[sensors-view] open {url}")
+    force_browser = (os.environ.get("SENSORS_VIEW_BROWSER") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "browser",
+    }
     opened = False
-    try:
-        import webview  # type: ignore
-
-        webview.create_window(APP_TITLE, url, width=1280, height=860)
-        webview.start()
-        opened = True
-    except Exception as exc:  # noqa: BLE001
-        print(f"[sensors-view] pywebview unavailable ({exc}); falling back to browser")
+    if not force_browser:
+        opened = _start_webview(url)
 
     if not opened:
         webbrowser.open(url)

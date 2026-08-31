@@ -23,15 +23,27 @@
         if (loc !== "zh" && loc !== "en") loc = "zh";
         root.lang = loc === "zh" ? "zh-CN" : "en";
       } catch (e) { /* ignore */ }
+      /* If app.js fails to load (offline / old WebView), do not stay on a blank page forever */
+      setTimeout(function () {
+        try {
+          if (document.body && document.body.classList.contains("page-booting")) {
+            document.body.classList.remove("page-booting");
+            var boot = document.getElementById("page-boot");
+            if (boot) boot.hidden = true;
+          }
+        } catch (e2) { /* ignore */ }
+      }, 8000);
     })();
   </script>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/fonts.css?v=62" />
   <link rel="icon" href="/static/assets/favicon.svg" type="image/svg+xml" />
-  <link rel="stylesheet" href="/static/style.css?v=34" />
+  <link rel="stylesheet" href="/static/style.css?v=62" />
 </head>
-<body class="sensors-view-page" data-i18n-title="meta.title" hidden>
+<body class="sensors-view-page page-booting" data-i18n-title="meta.title">
+  <div id="page-boot" class="page-boot" role="status" aria-live="polite">
+    <div class="page-boot-mark" aria-hidden="true"></div>
+    <p data-i18n="login.checkingSession">正在校验会话…</p>
+  </div>
   <div class="noise" aria-hidden="true"></div>
   <header class="top">
     <div class="brand-block">
@@ -148,10 +160,19 @@
       <form id="connect-form" class="connect-form" autocomplete="off">
         <div class="form-grid" id="form-fields"></div>
 
+        <div class="gripper-init-row" id="gripper-init-row" hidden>
+          <button type="button" class="btn primary" id="btn-gripper-init" data-i18n="control.gripperInit">初始化 / 校准</button>
+          <span class="form-hint" id="gripper-init-hint" data-i18n="control.gripperInitHint">优先执行：完全闭合再张开，记录 raw min/max；完成后自动测最大读取频率（不会开始写测频）</span>
+        </div>
+
         <div class="stream-row">
           <label class="field rate-field">
-            <span class="field-label" data-i18n="field.sampleRate">目标频率 Hz</span>
+            <span class="field-label" id="sample-rate-label" data-i18n="field.sampleRate">目标频率 Hz</span>
             <input id="sample-rate" type="number" min="0.2" max="2000" step="0.1" value="2" />
+          </label>
+          <label class="field rate-field" id="write-rate-field" hidden>
+            <span class="field-label" data-i18n="field.writeRate">写入目标频率 Hz</span>
+            <input id="write-rate" type="number" min="0.2" max="2000" step="0.1" value="8" />
           </label>
           <p class="form-hint rate-bounds-hint" id="rate-bounds-hint"></p>
           <label class="toggle block">
@@ -160,30 +181,54 @@
           </label>
         </div>
 
+        <section class="gripper-io-panel" id="gripper-io-panel" hidden>
+          <div class="preview-head">
+            <p class="brand tiny" data-i18n="gripperIo.kicker">gripper · read / write</p>
+            <p class="msg" data-i18n="control.hint.gripperIo">连续采样只读不写。初始化后由后台测最大读频；最大写频需点下方按钮，同样在后台测完再回报结果。</p>
+          </div>
+          <details class="rate-principle">
+            <summary data-i18n="rate.principle.title">读写频率测量原理</summary>
+            <div class="rate-principle-body">
+              <p data-i18n="rate.principle.read">最大读取频率：初始化/校准后，由服务端在进程内尽可能快地连续读位置（不经 HTTP 逐拍），用成功次数÷耗时得到吞吐，再乘 0.95 设为读取上限。前端只显示测速中，结束后渲染结果。</p>
+              <p data-i18n="rate.principle.write">最大写入频率：点测量按钮后，服务端在进程内按读频持续读并以写频发随机位置寻峰。前端只显示测速状态，结束后写入最大同步写频。连续采样仍走 HTTP 且只读不写。</p>
+              <p data-i18n="rate.principle.sample">连续采样：只做读取与可视化/落盘，不会下发位置。需要定位请用「固定下发」。</p>
+            </div>
+          </details>
+          <div class="gripper-io-grid">
+            <div class="gripper-io-col">
+              <p class="card-io-title" data-i18n="card.readChannel">读取通道</p>
+              <p class="card-io-value"><span class="k" data-i18n="card.readValue">读取值</span> <span id="gio-read-val">—</span></p>
+              <p class="card-io-hz" id="gio-read-hz" data-i18n="card.readHzWarm">读取 — Hz</p>
+            </div>
+            <div class="gripper-io-col">
+              <p class="card-io-title" data-i18n="card.writeChannel">写入通道</p>
+              <p class="card-io-value"><span class="k" data-i18n="card.writeValue">写入值</span> <span id="gio-write-val">—</span></p>
+              <p class="card-io-hz" id="gio-write-hz" data-i18n="card.writeHzWarm">写入实测 —</p>
+              <p class="card-io-max" id="gio-max-sync" data-i18n="card.maxSyncWriteWarm">最大同步写频 —</p>
+              <button type="button" class="btn ghost btn-write-probe" id="btn-write-probe" data-i18n="btn.writeProbe">测量最大写入频率</button>
+              <span class="form-hint" id="write-probe-hint"></span>
+            </div>
+          </div>
+        </section>
+
         <div class="modal-actions">
           <button type="button" class="btn primary" id="btn-start" data-i18n="btn.start">开始连续采样</button>
           <button type="button" class="btn danger" id="btn-stop" disabled data-i18n="btn.stop">停止</button>
           <button type="button" class="btn ghost" id="btn-once" data-i18n="btn.once">单次采样</button>
+          <button type="button" class="btn ghost" id="btn-reset-config" data-i18n="btn.resetConfig">重新应用配置</button>
           <span class="form-hint" id="form-hint"></span>
         </div>
       </form>
 
       <section class="control-panel" id="control-panel" hidden>
-        <div class="preview-head">
-          <p class="brand tiny" data-i18n="control.kicker">command · linear map</p>
-          <p class="msg" id="control-hint" data-i18n="control.hint.joints">显示 = rs·生数据 + ro；真实下发 = ws·显示 + wo（scale/offset 为浮点，scale 可为负）</p>
-        </div>
-        <div class="baseline-row">
-          <button type="button" class="btn ghost" id="btn-capture" data-i18n="btn.capture">从最新采样捕获显示基准</button>
-          <span class="form-hint" id="baseline-hint" data-i18n="control.baselineNone">尚未捕获</span>
-        </div>
-        <div class="delta-grid" id="delta-grid"></div>
         <div class="modal-actions">
-          <button type="button" class="btn primary" id="btn-random-cmd" data-i18n="btn.randomCmd">随机下发一次</button>
-          <label class="toggle block">
-            <input type="checkbox" id="auto-command" />
-            <span data-i18n="control.autoCmd">随连续采样自动随机下发</span>
-          </label>
+          <div class="fixed-cmd-row" id="fixed-cmd-row" hidden>
+            <label class="field fixed-cmd-field">
+              <span class="field-label" data-i18n="control.fixedValue">固定值 (norm)</span>
+              <input type="number" id="fixed-cmd-value" step="0.001" />
+            </label>
+            <button type="button" class="btn primary" id="btn-fixed-cmd" data-i18n="btn.fixedCmd">固定下发</button>
+          </div>
           <span class="form-hint" id="command-hint"></span>
         </div>
       </section>
@@ -288,8 +333,8 @@
       dryRun: {{ dry_run | tojson }},
     };
   </script>
-  <script src="/static/i18n.js?v=34"></script>
-  <script src="/static/appearance.js?v=19"></script>
-  <script src="/static/app.js?v=34"></script>
+  <script src="/static/i18n.js?v=62"></script>
+  <script src="/static/appearance.js?v=62"></script>
+  <script src="/static/app.js?v=62"></script>
 </body>
 </html>

@@ -88,6 +88,11 @@ a = Analysis(
     runtime_hooks=[],
     excludes=["tkinter", "matplotlib", "PySide2", "PySide6", "PyQt5", "PyQt6"],
     noarchive=False,
+    # Keep numpy/.py on disk next to extension modules — avoids misleading
+    # "import numpy from its source directory" when __config__ is only in PYZ.
+    module_collection_mode={
+        "numpy": "py",
+    },
 )
 
 pyz = PYZ(a.pure)

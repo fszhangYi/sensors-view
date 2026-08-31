@@ -203,6 +203,8 @@ def build_windows(*, skip_frontend: bool = True) -> Path:
                 "7. Default dry_run=true; edit configs\\view.yaml under AppData after first run",
                 "8. Hardware SDKs bundled: pyrealsense2, dynamixel-sdk, pyserial, pyzmq",
                 "   (RealSense still needs vendor USB driver on the Windows host)",
+                "9. Desktop window needs Microsoft Edge WebView2 Runtime",
+                "   If the window is blank, install WebView2 or set SENSORS_VIEW_BROWSER=1",
                 "",
             ]
         ),
@@ -444,6 +446,7 @@ def build_native(*, skip_frontend: bool = True) -> Path:
                 "8. Default dry_run=true; edit configs/view.yaml under the data dir after first run",
                 "9. Hardware SDKs bundled: pyrealsense2, dynamixel-sdk, pyserial, pyzmq",
                 "   (udev rules / vendor drivers may still be required on the host)",
+                "10. Desktop uses pywebview (GTK/Qt WebKit). Blank window → SENSORS_VIEW_BROWSER=1",
                 "",
             ]
         ),

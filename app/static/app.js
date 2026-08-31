@@ -24,10 +24,20 @@
   const formFields = document.getElementById("form-fields");
   const dryRunEl = document.getElementById("sample-dry-run");
   const rateEl = document.getElementById("sample-rate");
+  const rateLabelEl = document.getElementById("sample-rate-label");
+  const writeRateField = document.getElementById("write-rate-field");
+  const writeRateEl = document.getElementById("write-rate");
+  const gripperIoPanel = document.getElementById("gripper-io-panel");
+  const gioReadVal = document.getElementById("gio-read-val");
+  const gioWriteVal = document.getElementById("gio-write-val");
+  const gioReadHz = document.getElementById("gio-read-hz");
+  const gioWriteHz = document.getElementById("gio-write-hz");
+  const gioMaxSync = document.getElementById("gio-max-sync");
   const formHint = document.getElementById("form-hint");
   const btnStart = document.getElementById("btn-start");
   const btnStop = document.getElementById("btn-stop");
   const btnOnce = document.getElementById("btn-once");
+  const btnResetConfig = document.getElementById("btn-reset-config");
   const btnSaveStream = document.getElementById("btn-save-stream");
   const batchDryRunEl = document.getElementById("batch-dry-run");
   const btnBatchStart = document.getElementById("btn-batch-start");
@@ -58,22 +68,25 @@
   const streamStatus = document.getElementById("stream-status");
 
   const controlPanel = document.getElementById("control-panel");
-  const controlHint = document.getElementById("control-hint");
-  const deltaGrid = document.getElementById("delta-grid");
-  const btnCapture = document.getElementById("btn-capture");
-  const baselineHint = document.getElementById("baseline-hint");
-  const btnRandomCmd = document.getElementById("btn-random-cmd");
-  const autoCommandEl = document.getElementById("auto-command");
   const commandHint = document.getElementById("command-hint");
+  const gripperInitRow = document.getElementById("gripper-init-row");
+  const btnGripperInit = document.getElementById("btn-gripper-init");
+  const gripperInitHint = document.getElementById("gripper-init-hint");
+  const fixedCmdRow = document.getElementById("fixed-cmd-row");
+  const fixedCmdValueEl = document.getElementById("fixed-cmd-value");
+  const btnFixedCmd = document.getElementById("btn-fixed-cmd");
+  const btnWriteProbe = document.getElementById("btn-write-probe");
+  const writeProbeHint = document.getElementById("write-probe-hint");
 
   const RATE_PREFS_KEY = "sensors-view.ratePrefs";
+  const CONNECT_CFG_KEY = "sensors-view.connectConfig";
   const BATCH_SEQ_KEY = "sensors-view.batchSeq";
   /** @type {Record<string, { min: number, max: number, defaultHz: number }>} */
   const KIND_RATE_DEFAULTS = {
     realsense: { min: 5, max: 30, defaultHz: 15 },
     arm: { min: 100, max: 1000, defaultHz: 100 },
     gello: { min: 100, max: 1000, defaultHz: 100 },
-    gripper: { min: 1, max: 50, defaultHz: 10 },
+    gripper: { min: 1, max: 200, defaultHz: 8 },
     tactile: { min: 1, max: 50, defaultHz: 10 },
     ft: { min: 100, max: 2000, defaultHz: 200 },
     bus: { min: 1, max: 50, defaultHz: 10 },
@@ -87,7 +100,15 @@
   let currentDevice = null;
   let sessionId = null;
   let streamTimer = null;
+  let streamWriteTimer = null;
+  let streamReadPump = false;
+  let streamTuneTimer = null;
+  /** @type {any} */
+  let modalGripper = null;
   let tickInFlight = false;
+  let writeInFlight = false;
+  let writeProbeActive = false;
+  let writeProbeKeepStreaming = false;
   let streamStartedAt = 0;
   let lastPayload = null;
   let streamRecords = [];
@@ -96,7 +117,6 @@
   let streamRateTimes = [];
   let streamMeasuredHz = null;
   let streamRateOk = null;
-  let baseline = null; // number[]
   let lastDevices = [];
   const deviceCache = {};
   const selectedIds = new Set();
@@ -156,9 +176,16 @@
     return window.SensorsI18n?.fieldLabel?.(key, fallback) ?? fallback ?? key;
   }
 
+  function finishPageBoot() {
+    document.body.classList.remove("page-booting");
+    document.body.hidden = false;
+    const boot = document.getElementById("page-boot");
+    if (boot) boot.hidden = true;
+  }
+
   async function requireAuth() {
     try {
-      const res = await fetch("/api/auth/me");
+      const res = await fetch("/api/auth/me", { credentials: "same-origin" });
       const me = await res.json();
       if (me.authRequired && !me.authenticated) {
         const from = `${location.pathname}${location.search}${location.hash}` || "/";
@@ -166,13 +193,13 @@
         location.replace(`/login?from=${encodeURIComponent(safe)}`);
         return false;
       }
-      document.body.hidden = false;
+      finishPageBoot();
       currentAuthUser = me.user || null;
       if (btnLogout) btnLogout.hidden = !me.authRequired;
       if (btnUsers) btnUsers.hidden = !me.authRequired;
       return true;
     } catch {
-      document.body.hidden = false;
+      finishPageBoot();
       return true;
     }
   }
@@ -303,16 +330,26 @@
     let hzMin = Number(saved.hzMin);
     let hzMax = Number(saved.hzMax);
     let hz = Number(saved.hz);
+    let writeHz = Number(saved.writeHz);
+    let readCapHz = Number(saved.readCapHz);
     if (!Number.isFinite(hzMin)) hzMin = def.min;
     if (!Number.isFinite(hzMax)) hzMax = def.max;
+    // Migrate old gripper ceiling (40) so probed 100+ Hz read caps can apply.
+    if (isGripperKind(kind) && hzMax <= 40 && def.max > 40) hzMax = def.max;
     if (hzMax < hzMin) {
       const tmp = hzMin;
       hzMin = hzMax;
       hzMax = tmp;
     }
+    if (!Number.isFinite(readCapHz) || readCapHz <= 0) readCapHz = null;
+    else readCapHz = Math.min(hzMax, Math.max(hzMin, readCapHz));
+    const readMax =
+      isGripperKind(kind) && readCapHz != null ? Math.min(hzMax, readCapHz) : hzMax;
     if (!Number.isFinite(hz)) hz = def.defaultHz;
-    hz = Math.min(hzMax, Math.max(hzMin, hz));
-    return { hz, hzMin, hzMax };
+    hz = Math.min(readMax, Math.max(hzMin, hz));
+    if (!Number.isFinite(writeHz)) writeHz = isGripperKind(kind) ? Math.min(hzMax, Math.max(hzMin, def.defaultHz)) : hz;
+    writeHz = Math.min(hzMax, Math.max(hzMin, writeHz));
+    return { hz, hzMin, hzMax, writeHz, readCapHz };
   }
 
   function setRatePrefs(id, kind, patch) {
@@ -323,16 +360,27 @@
       next.hzMin = next.hzMax;
       next.hzMax = tmp;
     }
-    next.hz = Math.min(next.hzMax, Math.max(next.hzMin, Number(next.hz)));
+    let readCapHz = Number(next.readCapHz);
+    if (!Number.isFinite(readCapHz) || readCapHz <= 0) readCapHz = null;
+    else readCapHz = Math.min(next.hzMax, Math.max(next.hzMin, readCapHz));
+    next.readCapHz = readCapHz;
+    const readMax =
+      isGripperKind(kind) && readCapHz != null ? Math.min(next.hzMax, readCapHz) : next.hzMax;
+    next.hz = Math.min(readMax, Math.max(next.hzMin, Number(next.hz)));
+    next.writeHz = Math.min(next.hzMax, Math.max(next.hzMin, Number(next.writeHz)));
     ratePrefs[id] = next;
     saveRatePrefs();
     return next;
   }
 
-  function clampDeviceHz(v, prefs) {
+  function clampDeviceHz(v, prefs, { forWrite = false } = {}) {
     const n = Number(v);
-    if (!Number.isFinite(n)) return prefs.hz;
-    return Math.min(prefs.hzMax, Math.max(prefs.hzMin, n));
+    if (!Number.isFinite(n)) return forWrite ? prefs.writeHz : prefs.hz;
+    const max =
+      !forWrite && prefs.readCapHz != null
+        ? Math.min(prefs.hzMax, prefs.readCapHz)
+        : prefs.hzMax;
+    return Math.min(max, Math.max(prefs.hzMin, n));
   }
 
   function intervalMsForHz(hz) {
@@ -352,8 +400,12 @@
     const measured = ((times.length - 1) * 1000) / span;
     const target = Number(hz) || 0;
     const tol = Math.max(target * RATE_TOL_RATIO, Math.min(2, Math.max(0.5, target * 0.05)));
-    const ok = Math.abs(measured - target) <= tol;
+    const ok = target > 0 ? Math.abs(measured - target) <= tol : null;
     return { measured, ok };
+  }
+
+  function measureRateOnly(times, now = performance.now()) {
+    return observeRate(times, 0, now).measured;
   }
 
   function formatMeasured(hz) {
@@ -361,6 +413,15 @@
     if (hz >= 100) return hz.toFixed(0);
     if (hz >= 10) return hz.toFixed(1);
     return hz.toFixed(2);
+  }
+
+  function isGripperKind(kind) {
+    return kind === "gripper";
+  }
+
+  function formatGripperVal(v) {
+    if (v == null || !Number.isFinite(Number(v))) return "—";
+    return Number(v).toFixed(3);
   }
 
   function rateStatusLabel(ok) {
@@ -376,7 +437,17 @@
       return Math.min(2000, Math.max(0.2, n));
     }
     const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
-    return clampDeviceHz(v, prefs);
+    return clampDeviceHz(v, prefs, { forWrite: false });
+  }
+
+  function clampWriteHz(v) {
+    if (!currentDevice) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return 8;
+      return Math.min(2000, Math.max(0.2, n));
+    }
+    const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
+    return clampDeviceHz(v, prefs, { forWrite: true });
   }
 
   function intervalMs() {
@@ -386,15 +457,92 @@
   function applyModalRateBounds() {
     if (!currentDevice || !rateEl) return;
     const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
+    if (currentDevice.kind === "realsense") {
+      const cfg = currentDevice.config || {};
+      const fps = Number(cfg.fps);
+      if (Number.isFinite(fps) && fps > 0) {
+        prefs.hz = Math.min(prefs.hzMax, Math.max(prefs.hzMin, fps));
+        setRatePrefs(currentDevice.id, currentDevice.kind, prefs);
+      }
+    }
+    const isGripper = isGripperKind(currentDevice.kind);
+    const readMax =
+      isGripper && prefs.readCapHz != null ? Math.min(prefs.hzMax, prefs.readCapHz) : prefs.hzMax;
     rateEl.min = String(prefs.hzMin);
-    rateEl.max = String(prefs.hzMax);
-    rateEl.step = prefs.hzMax >= 100 ? "1" : "0.1";
+    rateEl.max = String(readMax);
+    rateEl.step = readMax >= 100 ? "1" : "0.1";
     rateEl.value = String(prefs.hz);
+    if (rateLabelEl) {
+      rateLabelEl.textContent = isGripper ? t("field.readRate") : t("field.sampleRate");
+    }
+    if (writeRateField) writeRateField.hidden = !isGripper;
+    if (writeRateEl && isGripper) {
+      writeRateEl.min = String(prefs.hzMin);
+      writeRateEl.max = String(prefs.hzMax);
+      writeRateEl.step = prefs.hzMax >= 100 ? "1" : "0.1";
+      writeRateEl.value = String(prefs.writeHz);
+    }
+    if (rateBoundsHint) {
+      if (isGripper) {
+        rateBoundsHint.textContent =
+          prefs.readCapHz != null
+            ? `${t("field.readCap", { hz: formatMeasured(prefs.readCapHz) })} · ${t("field.rateBounds", {
+                min: prefs.hzMin,
+                max: prefs.hzMax,
+              })}`
+            : t("field.readCapWarm");
+      } else {
+        rateBoundsHint.textContent = t("field.rateBounds", {
+          min: prefs.hzMin,
+          max: prefs.hzMax,
+        });
+      }
+    }
+  }
+
+  function syncGripperIoPanelVisibility() {
+    const isGripper = isGripperKind(currentDevice?.kind);
+    if (gripperIoPanel) gripperIoPanel.hidden = !isGripper;
+    if (gripperInitRow) gripperInitRow.hidden = !isGripper || !control().writable;
+    if (isGripper) {
+      const live = batchSessions.find((s) => s.id === currentDevice.id);
+      if (live) {
+        updateGripperIoPanel({
+          readValue: live.readValue,
+          writeValue: live.writeValue,
+          readMeasuredHz: live.readMeasuredHz,
+          writeMeasuredHz: live.writeMeasuredHz,
+          maxSyncWriteHz: live.maxSyncWriteHz,
+        });
+      } else {
+        resetGripperIoPanel();
+      }
+    }
+  }
+
+  function syncSampleRateFromStreamFps(sample, configUsed) {
+    if (currentDevice?.kind !== "realsense") return;
+    const fps = Number(sample?.fps ?? configUsed?.fps);
+    if (!Number.isFinite(fps) || fps <= 0) return;
+    const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
+    // Cap UI poll rate at the negotiated hardware fps (cannot usefully exceed it).
+    prefs.hzMax = Math.max(prefs.hzMin, fps);
+    prefs.hz = Math.min(prefs.hzMax, Math.max(prefs.hzMin, fps));
+    setRatePrefs(currentDevice.id, currentDevice.kind, prefs);
+    if (rateEl) rateEl.value = String(prefs.hz);
     if (rateBoundsHint) {
       rateBoundsHint.textContent = t("field.rateBounds", {
         min: prefs.hzMin,
         max: prefs.hzMax,
       });
+    }
+    // Reflect negotiated hardware fps back into the connect form.
+    currentDevice.config = { ...(currentDevice.config || {}), fps };
+    const fpsInput = formFields?.querySelector('[name="fps"]');
+    if (fpsInput) fpsInput.value = String(fps);
+    const req = Number(sample?.fps_requested);
+    if (Number.isFinite(req) && req > 0 && req !== fps && formHint) {
+      formHint.textContent = t("form.fpsFallback", { requested: req, actual: fps });
     }
   }
 
@@ -407,9 +555,6 @@
     btnStop.disabled = !on;
     btnOnce.disabled = on;
     dryRunEl.disabled = on;
-    formFields.querySelectorAll("input").forEach((el) => {
-      el.disabled = on;
-    });
     modal.classList.toggle("is-streaming", on);
   }
 
@@ -896,15 +1041,62 @@
     return `.card[data-id="${String(id).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"]`;
   }
 
-  function updateCardRateUi(id, { measured, ok, probeStatus } = {}) {
+  function updateGripperIoPanel(g = {}) {
+    if (!gripperIoPanel || gripperIoPanel.hidden) return;
+    if (gioReadVal && g.readValue !== undefined) gioReadVal.textContent = formatGripperVal(g.readValue);
+    if (gioWriteVal && g.writeValue !== undefined) gioWriteVal.textContent = formatGripperVal(g.writeValue);
+    if (gioReadHz) {
+      gioReadHz.textContent =
+        g.readMeasuredHz == null
+          ? t("card.readHzWarm")
+          : t("card.readHz", { hz: formatMeasured(g.readMeasuredHz) });
+    }
+    if (gioWriteHz) {
+      gioWriteHz.textContent =
+        g.writeMeasuredHz == null
+          ? t("card.writeHzWarm")
+          : t("card.writeHzMeasured", { hz: formatMeasured(g.writeMeasuredHz) });
+    }
+    if (gioMaxSync) {
+      gioMaxSync.textContent =
+        g.maxSyncWriteHz == null
+          ? t("card.maxSyncWriteWarm")
+          : t("card.maxSyncWrite", { hz: formatMeasured(g.maxSyncWriteHz) });
+    }
+  }
+
+  function resetGripperIoPanel() {
+    updateGripperIoPanel({
+      readValue: null,
+      writeValue: null,
+      readMeasuredHz: null,
+      writeMeasuredHz: null,
+      maxSyncWriteHz: null,
+    });
+  }
+
+  function updateCardRateUi(id, { measured, ok, probeStatus, gripper } = {}) {
     const card = grid?.querySelector(cardSelector(id));
     if (!card) return;
     const measuredEl = card.querySelector(".card-rate-measured");
     if (measuredEl) {
-      measuredEl.textContent =
-        measured == null
-          ? t("card.measuredWarm")
-          : t("card.measured", { hz: formatMeasured(measured) });
+      if (gripper) {
+        measuredEl.textContent =
+          gripper.readMeasuredHz != null || gripper.writeMeasuredHz != null
+            ? t("card.gripperSummary", {
+                read: formatMeasured(gripper.readMeasuredHz),
+                write: formatMeasured(gripper.writeMeasuredHz),
+                max: formatMeasured(gripper.maxSyncWriteHz),
+              })
+            : t("card.measuredWarm");
+        const hzEl = card.querySelector(".card-hz");
+        if (hzEl && gripper.writeTargetHz != null) hzEl.value = String(gripper.writeTargetHz);
+      } else {
+        measuredEl.textContent =
+          measured == null
+            ? t("card.measuredWarm")
+            : t("card.measured", { hz: formatMeasured(measured) });
+      }
     }
     const pill = card.querySelector(".status-pill");
     if (!pill) return;
@@ -947,7 +1139,6 @@
       dry_run: !!payload.dry_run,
       sample: payload.sample ?? null,
       raw: extractRawFromPayload(payload),
-      display: extractDisplayFromPayload(payload),
       config_used: payload.config_used ?? null,
       kind: payload.kind || null,
       name: payload.name || null,
@@ -984,6 +1175,15 @@
         clearInterval(s.timer);
         s.timer = null;
       }
+      if (s.writeTimer) {
+        clearInterval(s.writeTimer);
+        s.writeTimer = null;
+      }
+      if (s.tuneTimer) {
+        clearInterval(s.tuneTimer);
+        s.tuneTimer = null;
+      }
+      s.readPump = false;
     }
   }
 
@@ -992,9 +1192,94 @@
       clearInterval(s.timer);
       s.timer = null;
     }
+    if (s.writeTimer) {
+      clearInterval(s.writeTimer);
+      s.writeTimer = null;
+    }
+    if (s.tuneTimer) {
+      clearInterval(s.tuneTimer);
+      s.tuneTimer = null;
+    }
+    s.readPump = false;
+    if (isGripperKind(s.kind)) {
+      armGripperDualLoop(s);
+      return;
+    }
     s.timer = setInterval(() => {
       tickBatchDevice(s).catch(() => {});
     }, intervalMsForHz(s.hz));
+  }
+
+  function armGripperDualLoop(s) {
+    // Batch continuous sampling is read-only for grippers (no auto write probe).
+    s.readPump = false;
+    s.writesEnabled = false;
+    s.readHz = s.readHz ?? s.hz;
+    s.writeHz = s.writeHz ?? s.hz;
+    s.readTimes = s.readTimes || [];
+    s.writeTimes = s.writeTimes || [];
+    s.readTimes.length = 0;
+    s.writeTimes.length = 0;
+    s.writeOkWindow = [];
+    s.stableWriteMs = 0;
+    s.timer = setInterval(() => {
+      tickBatchGripperRead(s).catch(() => {});
+    }, intervalMsForHz(s.readHz));
+  }
+
+  function publishGripperIo(s) {
+    const g = {
+      readValue: s.readValue,
+      writeValue: s.writeValue,
+      readMeasuredHz: s.readMeasuredHz,
+      writeMeasuredHz: s.writeMeasuredHz,
+      maxSyncWriteHz: s.maxSyncWriteHz,
+      writeTargetHz: s.writeHz ?? s.hz,
+    };
+    updateCardRateUi(s.id, { ok: s.rateOk, gripper: g });
+    if (currentDevice?.id === s.id) {
+      updateGripperIoPanel(g);
+      // Only sync write target into the write field — never touch read rate input.
+      if (writeRateEl && g.writeTargetHz != null && document.activeElement !== writeRateEl) {
+        writeRateEl.value = String(g.writeTargetHz);
+      }
+    }
+  }
+
+  async function tickBatchGripperRead(s) {
+    if (!batchRunning || s.readInFlight || !s.sessionId) return;
+    s.readInFlight = true;
+    try {
+      const res = await fetch(`/api/session/${encodeURIComponent(s.sessionId)}/tick`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(`${s.id}: ${data.detail || res.status}`);
+      const reading = frameReadingFromPayload(data);
+      if (!batchStreams[s.id]) batchStreams[s.id] = [];
+      batchStreams[s.id].push({ t: new Date().toISOString(), channel: "read", ...reading });
+      s.sampleCount = batchStreams[s.id].length;
+      const norm = data.sample?.position_norm;
+      if (norm != null) s.readValue = Number(norm);
+      s.readMeasuredHz = measureRateOnly(s.readTimes);
+      s.measuredHz = s.readMeasuredHz;
+      if (batchMeta[s.id]) {
+        batchMeta[s.id].measuredHz = s.readMeasuredHz;
+        batchMeta[s.id].readMeasuredHz = s.readMeasuredHz;
+        batchMeta[s.id].hz = s.hz;
+      }
+      publishGripperIo(s);
+      updateLiveTile(s, data);
+      updateBatchHintText();
+    } catch (err) {
+      if (batchHint) batchHint.textContent = String(err.message || err);
+      if (liveHint) liveHint.textContent = String(err.message || err);
+      await stopBatch({ quiet: true });
+    } finally {
+      s.readInFlight = false;
+    }
   }
 
   async function tickBatchDevice(s) {
@@ -1092,13 +1377,27 @@
             sessionId: data.session_id,
             kind,
             name: data.name || deviceCache[id]?.name || id,
-            hz: prefs.hz,
+            hz: isGripperKind(kind) ? prefs.writeHz : prefs.hz,
+            readHz: prefs.hz,
+            writeHz: prefs.writeHz,
             hzMin: prefs.hzMin,
             hzMax: prefs.hzMax,
             timer: null,
+            writeTimer: null,
+            tuneTimer: null,
             tickInFlight: false,
+            readInFlight: false,
+            writeInFlight: false,
+            readPump: false,
             times: [],
+            readTimes: [],
+            writeTimes: [],
             measuredHz: null,
+            readMeasuredHz: null,
+            writeMeasuredHz: null,
+            readValue: null,
+            writeValue: null,
+            maxSyncWriteHz: null,
             rateOk: null,
             sampleCount: 0,
           };
@@ -1370,7 +1669,7 @@
       if (hzEl) {
         hzEl.min = String(p.hzMin);
         hzEl.max = String(p.hzMax);
-        hzEl.value = String(p.hz);
+        hzEl.value = String(isGripperKind(d.kind) ? p.writeHz : p.hz);
       }
       if (minEl) minEl.value = String(p.hzMin);
       if (maxEl) maxEl.value = String(p.hzMax);
@@ -1381,13 +1680,28 @@
       const next = setRatePrefs(d.id, d.kind, patch);
       syncInputs(next);
       const live = batchSessions.find((s) => s.id === d.id);
-      if (live && patch.hz != null) {
-        live.hz = next.hz;
-        live.times = [];
-        live.measuredHz = null;
-        live.rateOk = null;
-        armBatchSessionTimer(live);
-        updateCardRateUi(d.id, { measured: null, ok: null });
+      if (live && (patch.hz != null || patch.writeHz != null)) {
+        if (isGripperKind(live.kind)) {
+          if (patch.writeHz != null) live.writeHz = next.writeHz;
+          if (patch.hz != null) live.readHz = next.hz;
+          live.hz = live.writeHz;
+          live.times = [];
+          live.writeTimes = [];
+          live.readTimes = [];
+          live.measuredHz = null;
+          live.writeMeasuredHz = null;
+          live.rateOk = null;
+          live.stableWriteMs = 0;
+          armBatchSessionTimer(live);
+          publishGripperIo(live);
+        } else {
+          live.hz = next.hz;
+          live.times = [];
+          live.measuredHz = null;
+          live.rateOk = null;
+          armBatchSessionTimer(live);
+          updateCardRateUi(d.id, { measured: null, ok: null });
+        }
       }
       if (currentDevice?.id === d.id) {
         applyModalRateBounds();
@@ -1399,20 +1713,153 @@
     };
 
     hzEl?.addEventListener("change", () => {
-      apply({ hz: clampDeviceHz(hzEl.value, getRatePrefs(d.id, d.kind)) });
+      const cur = getRatePrefs(d.id, d.kind);
+      const forWrite = isGripperKind(d.kind);
+      const v = clampDeviceHz(hzEl.value, cur, { forWrite });
+      if (forWrite) apply({ writeHz: v });
+      else apply({ hz: v });
     });
     minEl?.addEventListener("change", () => {
       const cur = getRatePrefs(d.id, d.kind);
       let hzMin = Number(minEl.value);
       if (!Number.isFinite(hzMin)) hzMin = cur.hzMin;
-      apply({ hzMin, hz: clampDeviceHz(cur.hz, { ...cur, hzMin }) });
+      apply({
+        hzMin,
+        hz: clampDeviceHz(cur.hz, { ...cur, hzMin }),
+        writeHz: clampDeviceHz(cur.writeHz, { ...cur, hzMin }, { forWrite: true }),
+      });
     });
     maxEl?.addEventListener("change", () => {
       const cur = getRatePrefs(d.id, d.kind);
       let hzMax = Number(maxEl.value);
       if (!Number.isFinite(hzMax)) hzMax = cur.hzMax;
-      apply({ hzMax, hz: clampDeviceHz(cur.hz, { ...cur, hzMax }) });
+      apply({
+        hzMax,
+        hz: clampDeviceHz(cur.hz, { ...cur, hzMax }),
+        writeHz: clampDeviceHz(cur.writeHz, { ...cur, hzMax }, { forWrite: true }),
+      });
     });
+  }
+
+  async function ensureModalSession() {
+    if (sessionId) return { started: false };
+    persistCurrentFormConfig();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 45000);
+    const res = await fetch(`/api/session/start/${encodeURIComponent(currentDevice.id)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        config: collectFormConfig(),
+        dry_run: dryRunEl.checked,
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    sessionId = data.session_id;
+    if (data.config_used) {
+      currentDevice.config = { ...currentDevice.config, ...data.config_used };
+      saveDeviceConfig(currentDevice.id, data.config_used);
+    }
+    streamStartedAt = Date.now();
+    streamRecords = [];
+    streamRecording = true;
+    streamRateTimes = [];
+    streamMeasuredHz = null;
+    streamRateOk = null;
+    updateSaveStreamBtn();
+    setStreamingUi(true);
+    showViz(data);
+    syncSampleRateFromStreamFps(data.sample, data.config_used);
+    updateStreamStatus(data.tick);
+    return { started: true, data };
+  }
+
+  async function calibrateGripper() {
+    if (!currentDevice?.id || currentDevice.kind !== "gripper") return;
+    const btn = btnGripperInit;
+    const prevText = btn?.textContent;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = t("control.gripperInitBusy");
+    }
+    if (btnWriteProbe) btnWriteProbe.disabled = true;
+    await stopStream({ quiet: true });
+    const baseBody = {
+      config: collectFormConfig(),
+      dry_run: dryRunEl.checked,
+      read_duration_s: 10.0,
+    };
+    try {
+      // 1) calibrate script (worker thread + subprocess)
+      gripperInitHint.textContent = t("control.gripperInitBusy");
+      if (formHint) formHint.textContent = t("control.gripperInitBusy");
+      const calRes = await fetch(`/api/probe/${encodeURIComponent(currentDevice.id)}/gripper/calibrate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(baseBody),
+      });
+      const calData = await calRes.json().catch(() => ({}));
+      if (!calRes.ok) throw new Error(calData.detail || `HTTP ${calRes.status}`);
+      const cr = calData.command_result || {};
+      if (cr.ok === false) throw new Error(cr.error || t("control.gripperInitFailed"));
+      if (calData.config_used) {
+        currentDevice.config = { ...currentDevice.config, ...calData.config_used };
+        saveDeviceConfig(currentDevice.id, currentDevice.config);
+        baseBody.config = { ...baseBody.config, ...calData.config_used };
+      }
+
+      // 2) dedicated READ-rate script (separate process)
+      gripperInitHint.textContent = t("control.readProbeBusy");
+      if (formHint) formHint.textContent = t("control.readProbeBusy");
+      const readRes = await fetch(`/api/probe/${encodeURIComponent(currentDevice.id)}/gripper/read`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(baseBody),
+      });
+      const readData = await readRes.json().catch(() => ({}));
+      if (!readRes.ok) throw new Error(readData.detail || `HTTP ${readRes.status}`);
+      const probe = readData.read_probe || {};
+
+      const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
+      const rawCap = Number(probe.read_cap_hz);
+      let hzMax = prefs.hzMax;
+      if (Number.isFinite(rawCap) && rawCap > hzMax) hzMax = Math.ceil(rawCap);
+      const cap = Math.max(
+        prefs.hzMin,
+        Math.min(hzMax, Number.isFinite(rawCap) ? rawCap : prefs.hzMin)
+      );
+      setRatePrefs(currentDevice.id, currentDevice.kind, {
+        hzMax,
+        readCapHz: cap,
+        hz: Math.min(cap, prefs.hz),
+      });
+      applyModalRateBounds();
+      const doneInit = t("control.gripperInitDone", {
+        min: cr.position_raw_min ?? "—",
+        max: cr.position_raw_max ?? "—",
+      });
+      const doneRead = t("control.readProbeDone", { hz: formatMeasured(cap) });
+      const msg = `${doneInit} · ${doneRead}`;
+      gripperInitHint.textContent = msg;
+      if (formHint) formHint.textContent = msg;
+      updateGripperIoPanel({
+        readMeasuredHz: Number(probe.measured_hz) || null,
+        writeMeasuredHz: null,
+        maxSyncWriteHz: null,
+      });
+    } catch (err) {
+      gripperInitHint.textContent = String(err.message || err);
+      if (formHint) formHint.textContent = String(err.message || err);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = prevText || t("control.gripperInit");
+      }
+      if (btnWriteProbe) btnWriteProbe.disabled = false;
+    }
   }
 
   function renderCards(devices) {
@@ -1449,9 +1896,17 @@
         const status = live && live.rateOk === false ? "rate" : live && live.rateOk === true ? "ok" : d.status;
         const statusText = status === "rate" ? t("status.rate") : status;
         const measuredText =
-          live && live.measuredHz != null
-            ? t("card.measured", { hz: formatMeasured(live.measuredHz) })
-            : t("card.measuredWarm");
+          live && isGripperKind(d.kind)
+            ? live.readMeasuredHz != null || live.writeMeasuredHz != null
+              ? t("card.gripperSummary", {
+                  read: formatMeasured(live.readMeasuredHz),
+                  write: formatMeasured(live.writeMeasuredHz),
+                  max: formatMeasured(live.maxSyncWriteHz),
+                })
+              : t("card.measuredWarm")
+            : live && live.measuredHz != null
+              ? t("card.measured", { hz: formatMeasured(live.measuredHz) })
+              : t("card.measuredWarm");
         return `
           <article class="card clickable${selected ? " is-selected" : ""}" style="animation-delay:${Math.min(i * 0.03, 0.3)}s" data-id="${escapeHtml(d.id)}" data-status="${escapeHtml(status)}" tabindex="0" role="button">
             <div class="card-head">
@@ -1468,7 +1923,7 @@
             <p class="msg">${escapeHtml(d.message || "")}</p>
             <div class="card-rate" data-id="${escapeHtml(d.id)}">
               <label class="field">
-                <span class="field-label">${escapeHtml(t("card.hz"))}</span>
+                <span class="field-label">${escapeHtml(isGripperKind(d.kind) ? t("card.writeHz") : t("card.hz"))}</span>
                 <input type="number" class="card-hz" step="${prefs.hzMax >= 100 ? "1" : "0.1"}" value="${prefs.hz}" ${batchRunning && !live ? "disabled" : ""} />
               </label>
               <label class="field">
@@ -1527,17 +1982,62 @@
     setBatchUi();
   }
 
+  function loadDeviceConfig(id) {
+    try {
+      const all = JSON.parse(localStorage.getItem(CONNECT_CFG_KEY) || "{}");
+      return all[id] && typeof all[id] === "object" ? { ...all[id] } : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveDeviceConfig(id, cfg) {
+    if (!id || !cfg) return;
+    try {
+      const all = JSON.parse(localStorage.getItem(CONNECT_CFG_KEY) || "{}");
+      all[id] = { ...(all[id] || {}), ...cfg };
+      localStorage.setItem(CONNECT_CFG_KEY, JSON.stringify(all));
+    } catch {
+      /* ignore quota errors */
+    }
+  }
+
+  function mergeDeviceConfig(serverConfig, id) {
+    const saved = loadDeviceConfig(id);
+    const merged = { ...(serverConfig || {}), ...saved };
+    return merged;
+  }
+
+  function persistCurrentFormConfig() {
+    if (!currentDevice?.id) return;
+    const cfg = collectFormConfig();
+    saveDeviceConfig(currentDevice.id, cfg);
+    currentDevice.config = { ...(currentDevice.config || {}), ...cfg };
+  }
+
   function fieldValue(cfg, key, asType) {
     const v = cfg?.[key];
     if (asType === "int_list" && Array.isArray(v)) return v.join(", ");
+    if (asType === "bool") return v ? "1" : "";
     if (v == null) return "";
     return String(v);
   }
 
+  function configBool(cfg, key, fallback = false) {
+    const v = cfg?.[key];
+    if (v == null) return fallback;
+    if (typeof v === "boolean") return v;
+    return String(v).toLowerCase() === "true" || String(v) === "1";
+  }
+
   function collectFormConfig() {
     const out = {};
-    formFields.querySelectorAll("input[name]").forEach((input) => {
-      out[input.name] = input.value;
+    formFields.querySelectorAll("input[name], select[name]").forEach((input) => {
+      if (input.type === "checkbox") {
+        out[input.name] = input.checked;
+      } else {
+        out[input.name] = input.value;
+      }
     });
     return out;
   }
@@ -1598,7 +2098,9 @@
             const label = (c.labels && c.labels[i]) || String(i);
             return `
               <div class="bar">
-                <div class="bar-col" style="height:${h}%" title="${escapeHtml(String(n))}"></div>
+                <div class="bar-track">
+                  <div class="bar-col" style="height:${h}%" title="${escapeHtml(String(n))}"></div>
+                </div>
                 <span class="bar-label">${escapeHtml(label)}</span>
                 <span class="bar-num">${n.toFixed(3)}</span>
               </div>`;
@@ -1615,70 +2117,43 @@
 
   function showControlPanel() {
     const c = control();
-    if (!c.writable) {
+    const isGripper = c.writable && c.mode === "gripper";
+    if (!isGripper) {
       controlPanel.hidden = true;
+      if (gripperInitRow) gripperInitRow.hidden = true;
+      if (fixedCmdRow) fixedCmdRow.hidden = true;
       return;
     }
     controlPanel.hidden = false;
-    controlHint.textContent =
-      c.mode === "gripper" ? t("control.hint.gripper") : t("control.hint.joints");
-    const n = c.num_dofs || 1;
-    const labels = c.labels || [];
-    const defDelta = c.default_delta ?? 0.05;
-    const rs = c.read_scale || [];
-    const ro = c.read_offset || [];
-    const ws = c.write_scale || [];
-    const wo = c.write_offset || [];
-    const fmt = (v, fallback) => {
-      const n = Number(v);
-      if (!Number.isFinite(n)) return String(fallback);
-      // keep decimals visible (e.g. -0.5, 1.5708); avoid sci-notation for typical ranges
-      return String(Number(n.toPrecision(12)));
-    };
-    deltaGrid.innerHTML = Array.from({ length: n }, (_, i) => {
-      const label = labels[i] || `dof${i + 1}`;
-      const base = baseline?.[i];
-      return `
-        <div class="delta-card" data-i="${i}">
-          <span class="dof-name">${escapeHtml(label)} (${escapeHtml(c.unit || "")})</span>
-          <span class="baseline">${escapeHtml(t("control.baselineLabel", { val: base == null ? "—" : Number(base).toFixed(4) }))}</span>
-          <label class="affine-field"><span>${escapeHtml(t("control.rs"))}</span><input type="number" class="rs-input" data-i="${i}" step="0.001" inputmode="decimal" value="${fmt(rs[i], 1)}" /></label>
-          <label class="affine-field"><span>${escapeHtml(t("control.ro"))}</span><input type="number" class="ro-input" data-i="${i}" step="0.001" inputmode="decimal" value="${fmt(ro[i], 0)}" /></label>
-          <label class="affine-field"><span>${escapeHtml(t("control.ws"))}</span><input type="number" class="ws-input" data-i="${i}" step="0.001" inputmode="decimal" value="${fmt(ws[i], 1)}" /></label>
-          <label class="affine-field"><span>${escapeHtml(t("control.wo"))}</span><input type="number" class="wo-input" data-i="${i}" step="0.001" inputmode="decimal" value="${fmt(wo[i], 0)}" /></label>
-          <label class="affine-field"><span>${escapeHtml(t("control.delta"))}</span><input type="number" class="delta-input" data-i="${i}" min="${c.min_delta ?? 0}" max="${c.max_delta ?? 1}" step="0.001" value="${fmt(defDelta, 0.05)}" /></label>
-        </div>`;
-    }).join("");
-  }
-
-  function refreshBaselineLabels() {
-    deltaGrid.querySelectorAll(".delta-card").forEach((card) => {
-      const i = Number(card.dataset.i);
-      const el = card.querySelector(".baseline");
-      const base = baseline?.[i];
-      if (el) {
-        el.textContent = t("control.baselineLabel", {
-          val: base == null ? "—" : Number(base).toFixed(4),
-        });
+    if (gripperInitRow) {
+      gripperInitRow.hidden = false;
+      if (gripperInitHint) {
+        const cfg = currentDevice?.config || {};
+        const prefs = currentDevice ? getRatePrefs(currentDevice.id, currentDevice.kind) : null;
+        if (prefs?.readCapHz != null) {
+          gripperInitHint.textContent = t("control.readProbeDone", {
+            hz: formatMeasured(prefs.readCapHz),
+          });
+        } else if (cfg.position_raw_min != null && cfg.position_raw_max != null) {
+          gripperInitHint.textContent = t("control.gripperInitDone", {
+            min: cfg.position_raw_min,
+            max: cfg.position_raw_max,
+          });
+        } else {
+          gripperInitHint.textContent = t("control.gripperInitHint");
+        }
       }
-    });
-  }
-
-  function readAffineColumn(cls, fallback) {
-    const c = control();
-    const n = c.num_dofs || 1;
-    const out = [];
-    for (let i = 0; i < n; i++) {
-      const input = deltaGrid.querySelector(`.${cls}[data-i="${i}"]`);
-      let v = Number(input?.value);
-      if (!Number.isFinite(v)) v = fallback;
-      out.push(v);
     }
-    return out;
-  }
-
-  function applyAffine(values, scales, offsets) {
-    return values.map((v, i) => Number(scales[i] ?? 1) * Number(v) + Number(offsets[i] ?? 0));
+    if (fixedCmdRow) {
+      fixedCmdRow.hidden = false;
+      if (fixedCmdValueEl) {
+        const lo = c.value_min ?? 0;
+        const hi = c.value_max ?? 0.637;
+        fixedCmdValueEl.min = String(lo);
+        fixedCmdValueEl.max = String(hi);
+        fixedCmdValueEl.step = "0.001";
+      }
+    }
   }
 
   function extractRawFromPayload(payload) {
@@ -1690,7 +2165,7 @@
       if (Array.isArray(joints) && joints.length) {
         return joints.slice(0, c.num_dofs).map(Number);
       }
-      return null; // dry-run placeholder lives in viz only
+      return null;
     }
     if (c.mode === "gripper") {
       if (sample.position_norm != null) return [Number(sample.position_norm)];
@@ -1699,125 +2174,10 @@
     return null;
   }
 
-  function extractDisplayFromPayload(payload) {
-    const c = control();
-    if (!c.writable || !payload) return null;
-    const raw = extractRawFromPayload(payload);
-    if (raw) {
-      const rs = readAffineColumn("rs-input", 1);
-      const ro = readAffineColumn("ro-input", 0);
-      return applyAffine(raw, rs, ro);
-    }
-    // Fallback: dry-run synthetic viz already in display-ish space
-    if (c.mode === "joints") {
-      const chart = (payload.viz?.charts || []).find((x) => x.type === "bars");
-      if (chart?.values?.length) return chart.values.slice(0, c.num_dofs).map(Number);
-      return Array.from({ length: c.num_dofs }, () => 0);
-    }
-    if (c.mode === "gripper") {
-      const gauge = (payload.viz?.charts || []).find((x) => x.type === "gauge");
-      if (gauge && gauge.value != null) return [Number(gauge.value)];
-      return [0.3];
-    }
-    return null;
-  }
-
-  function remappedViz(payload) {
-    const viz = JSON.parse(JSON.stringify(payload.viz || {}));
-    const c = control();
-    if (!c.writable) return viz;
-    const display = extractDisplayFromPayload(payload);
-    const raw = extractRawFromPayload(payload);
-    if (!display) return viz;
-
-    if (c.mode === "joints") {
-      const chart = (viz.charts || []).find((x) => x.type === "bars");
-      if (chart) {
-        chart.title = t("viz.jointsDisplay");
-        chart.values = display;
-      }
-    } else if (c.mode === "gripper") {
-      const gauge = (viz.charts || []).find((x) => x.type === "gauge");
-      if (gauge) {
-        gauge.title = t("viz.gripperDisplay");
-        gauge.value = display[0];
-      }
-    }
-
-    viz.metrics = (viz.metrics || []).filter((m) => !String(m.label).startsWith("raw_") && !String(m.label).startsWith("disp_"));
-    if (raw) {
-      raw.forEach((v, i) => viz.metrics.push({ label: `raw_${i + 1}`, value: Number(v).toFixed(4) }));
-    }
-    display.forEach((v, i) => viz.metrics.push({ label: `disp_${i + 1}`, value: Number(v).toFixed(4) }));
-    return viz;
-  }
-
-  function captureBaseline() {
-    const vals = extractDisplayFromPayload(lastPayload);
-    if (!vals) {
-      baselineHint.textContent = t("control.baselineNeedSample");
-      return;
-    }
-    baseline = vals;
-    baselineHint.textContent = t("control.baselineCaptured", {
-      vals: vals.map((v) => v.toFixed(3)).join(", "),
-    });
-    refreshBaselineLabels();
-  }
-
-  function readDeltas() {
-    const c = control();
-    const n = c.num_dofs || 1;
-    const out = [];
-    for (let i = 0; i < n; i++) {
-      const input = deltaGrid.querySelector(`.delta-input[data-i="${i}"]`);
-      let d = Number(input?.value);
-      if (!Number.isFinite(d)) d = c.default_delta ?? 0.05;
-      d = Math.max(c.min_delta ?? 0, Math.min(c.max_delta ?? d, Math.abs(d)));
-      out.push(d);
-    }
-    return out;
-  }
-
-  function randomDisplayFromBaseline() {
-    const c = control();
-    if (!baseline) throw new Error(t("cmd.needBaseline"));
-    const deltas = readDeltas();
-    return baseline.map((b, i) => {
-      const d = deltas[i] ?? 0;
-      let v = b + (Math.random() * 2 - 1) * d;
-      if (c.mode === "gripper") {
-        // clamp in display space using mapped limits of raw [0, 0.637] is imperfect when scale≠1;
-        // keep soft clamp on display using value_min/max only when scales≈identity.
-        const rs = readAffineColumn("rs-input", 1)[0];
-        const ro = readAffineColumn("ro-input", 0)[0];
-        const lo = Math.min(rs * (c.value_min ?? 0) + ro, rs * (c.value_max ?? 0.637) + ro);
-        const hi = Math.max(rs * (c.value_min ?? 0) + ro, rs * (c.value_max ?? 0.637) + ro);
-        v = Math.max(lo, Math.min(hi, v));
-      }
-      return v;
-    });
-  }
-
-  function displayToRealCommand(displayValues) {
-    const c = control();
-    const ws = readAffineColumn("ws-input", 1);
-    const wo = readAffineColumn("wo-input", 0);
-    const real = applyAffine(displayValues, ws, wo);
-    if (c.mode === "joints") {
-      return { joints: real, display: displayValues };
-    }
-    return { position_norm: real[0], display: displayValues };
-  }
-
-  function randomCommandFromBaseline() {
-    const display = randomDisplayFromBaseline();
-    return displayToRealCommand(display);
-  }
-
-  async function sendCommand(command) {
-    const bodyCmd = { ...command };
-    delete bodyCmd.display;
+  async function sendCommand(command, { stream } = {}) {
+    // One-shot commands wait by default; gripper write-rate probe uses wait_ms:0 directly.
+    const useStream = stream === true;
+    const bodyCmd = { ...command, stream: useStream };
     let res;
     if (sessionId) {
       res = await fetch(`/api/session/${encodeURIComponent(sessionId)}/command`, {
@@ -1838,21 +2198,27 @@
     }
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-    data._display = command.display;
-    data._real = bodyCmd;
+    data._command = bodyCmd;
     return data;
   }
 
-  async function randomCommandOnce() {
+  async function fixedCommandOnce() {
+    const c = control();
+    if (c.mode !== "gripper") return;
+    const raw = Number(fixedCmdValueEl?.value);
+    if (!Number.isFinite(raw)) {
+      commandHint.textContent = t("control.fixedInvalid");
+      return;
+    }
+    const lo = c.value_min ?? 0;
+    const hi = c.value_max ?? 0.637;
+    const positionNorm = Math.max(lo, Math.min(hi, raw));
     try {
-      const command = randomCommandFromBaseline();
       commandHint.textContent = t("cmd.sending");
+      const command = { position_norm: positionNorm };
       const data = await sendCommand(command);
       const cr = data.command_result || {};
-      const vars = {
-        display: JSON.stringify(command.display),
-        real: JSON.stringify(data._real),
-      };
+      const vars = { value: formatGripperVal(positionNorm) };
       commandHint.textContent = cr.dry_run ? t("cmd.dryRun", vars) : t("cmd.sent", vars);
     } catch (err) {
       commandHint.textContent = String(err.message || err);
@@ -1875,7 +2241,6 @@
       dry_run: !!payload.dry_run,
       sample: payload.sample ?? null,
       raw: extractRawFromPayload(payload),
-      display: extractDisplayFromPayload(payload),
       config_used: payload.config_used ?? null,
     });
     updateSaveStreamBtn();
@@ -1936,19 +2301,17 @@
   function showViz(payload) {
     lastPayload = payload;
     if (streamRecording) recordStreamSample(payload);
-    const viz = remappedViz(payload);
+    const viz = payload.viz || {};
     modalPreview.hidden = false;
     vizNote.textContent = viz.note || (payload.dry_run ? t("viz.noteDry") : t("viz.noteLive"));
     renderMetrics(document.getElementById("modal-metrics"), viz.metrics);
     renderImages(document.getElementById("modal-images"), viz.images);
     renderCharts(document.getElementById("modal-charts"), viz.charts);
     const raw = extractRawFromPayload(payload);
-    const disp = extractDisplayFromPayload(payload);
     vizJson.textContent = JSON.stringify(
       {
         tick: payload.tick,
         raw,
-        display: disp,
         sample: payload.sample,
         config_used: payload.config_used,
         dry_run: payload.dry_run,
@@ -1957,9 +2320,6 @@
       null,
       2
     );
-    if (control().writable && !baseline) {
-      baselineHint.textContent = t("control.baselineReady");
-    }
   }
 
   function updateStreamStatus(tick) {
@@ -1969,14 +2329,13 @@
     }
     const hz = clampHz(rateEl.value);
     const elapsed = ((Date.now() - streamStartedAt) / 1000).toFixed(1);
-    const auto = autoCommandEl.checked ? t("stream.auto") : "";
     streamStatus.textContent = t("stream.running", {
       hz,
       measured: formatMeasured(streamMeasuredHz),
       rateStatus: rateStatusLabel(streamRateOk),
       tick: tick ?? "—",
       elapsed,
-      auto,
+      auto: "",
     });
     if (currentDevice?.id) {
       updateCardRateUi(currentDevice.id, {
@@ -1986,27 +2345,62 @@
     }
   }
 
+  function clearStreamWriteProbeTimers() {
+    if (streamWriteTimer) {
+      clearInterval(streamWriteTimer);
+      streamWriteTimer = null;
+    }
+    if (streamTuneTimer) {
+      clearInterval(streamTuneTimer);
+      streamTuneTimer = null;
+    }
+  }
+
+  function updateWriteProbeBtn() {
+    if (!btnWriteProbe) return;
+    btnWriteProbe.textContent = t("btn.writeProbe");
+    btnWriteProbe.classList.remove("danger", "primary");
+    btnWriteProbe.classList.add("ghost");
+    btnWriteProbe.disabled = !!writeProbeActive;
+  }
+
   function clearStreamTimer() {
+    streamReadPump = false;
     if (streamTimer) {
       clearInterval(streamTimer);
       streamTimer = null;
     }
+    clearStreamWriteProbeTimers();
   }
 
   async function stopStream({ quiet = false } = {}) {
+    writeProbeActive = false;
+    updateWriteProbeBtn();
     clearStreamTimer();
     const sid = sessionId;
     const prevId = currentDevice?.id;
+    const prevKind = currentDevice?.kind;
     sessionId = null;
     streamRecording = false;
     streamRateTimes = [];
     streamMeasuredHz = null;
     streamRateOk = null;
+    writeInFlight = false;
+    writeProbeKeepStreaming = false;
+    modalGripper = null;
+    resetGripperIoPanel();
     updateSaveStreamBtn();
     setStreamingUi(false);
     if (prevId && !batchRunning) {
       const probe = deviceCache[prevId]?.status;
-      updateCardRateUi(prevId, { measured: null, ok: null, probeStatus: probe });
+      updateCardRateUi(prevId, {
+        measured: null,
+        ok: null,
+        probeStatus: probe,
+        gripper: isGripperKind(prevKind)
+          ? { readValue: null, writeValue: null, readMeasuredHz: null, writeMeasuredHz: null, maxSyncWriteHz: null }
+          : undefined,
+      });
     }
     if (!sid) {
       if (!quiet) formHint.textContent = t("form.stopped");
@@ -2026,19 +2420,25 @@
     if (!sessionId || tickInFlight) return;
     tickInFlight = true;
     try {
-      if (autoCommandEl.checked && control().writable && baseline) {
-        try {
-          await sendCommand(randomCommandFromBaseline());
-        } catch (err) {
-          commandHint.textContent = String(err.message || err);
-        }
-      }
-      const res = await fetch(`/api/session/${encodeURIComponent(sessionId)}/tick`, { method: "POST" });
+      const res = await fetch(`/api/session/${encodeURIComponent(sessionId)}/tick`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-      const evaled = observeRate(streamRateTimes, clampHz(rateEl.value));
-      streamMeasuredHz = evaled.measured;
-      streamRateOk = evaled.ok;
+      if (isGripperKind(currentDevice?.kind) && modalGripper) {
+        const norm = data.sample?.position_norm;
+        if (norm != null) modalGripper.readValue = Number(norm);
+        modalGripper.readMeasuredHz = measureRateOnly(modalGripper.readTimes);
+        streamMeasuredHz = modalGripper.readMeasuredHz;
+        streamRateOk = modalGripper.rateOk;
+        publishGripperIo(modalGripper);
+      } else {
+        const evaled = observeRate(streamRateTimes, clampHz(rateEl.value));
+        streamMeasuredHz = evaled.measured;
+        streamRateOk = evaled.ok;
+      }
       showViz(data);
       updateStreamStatus(data.tick);
     } catch (err) {
@@ -2049,9 +2449,174 @@
     }
   }
 
+  function ensureModalGripperState() {
+    const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
+    if (!modalGripper) {
+      modalGripper = {
+        id: currentDevice.id,
+        kind: currentDevice.kind,
+        hz: prefs.writeHz,
+        readHz: prefs.hz,
+        writeHz: prefs.writeHz,
+        hzMin: prefs.hzMin,
+        hzMax: prefs.hzMax,
+        readTimes: [],
+        writeTimes: [],
+        writeOkWindow: [],
+        readValue: null,
+        writeValue: null,
+        readMeasuredHz: null,
+        writeMeasuredHz: null,
+        maxSyncWriteHz: null,
+        rateOk: null,
+        writesEnabled: false,
+        baselineUntil: 0,
+        baselineReadHz: null,
+        stableWriteMs: 0,
+      };
+      resetGripperIoPanel();
+    } else {
+      modalGripper.readHz = prefs.hz;
+      modalGripper.writeHz = prefs.writeHz;
+      modalGripper.hzMin = prefs.hzMin;
+      modalGripper.hzMax = prefs.hzMax;
+    }
+    return modalGripper;
+  }
+
   function armStreamTimer() {
     clearStreamTimer();
+    if (isGripperKind(currentDevice?.kind)) {
+      ensureModalGripperState();
+      const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
+      modalGripper.readHz = prefs.hz;
+      // Continuous sampling: read-only. Rate probes run in-process on the backend.
+      streamTimer = setInterval(tickOnce, intervalMsForHz(prefs.hz));
+      return;
+    }
+    modalGripper = null;
     streamTimer = setInterval(tickOnce, intervalMs());
+  }
+
+  async function runGripperWriteProbe() {
+    if (!currentDevice?.id || !isGripperKind(currentDevice.kind)) return;
+    if (writeProbeActive) return;
+    const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
+    if (prefs.readCapHz == null) {
+      const msg = t("control.writeProbeNeedInit");
+      if (writeProbeHint) writeProbeHint.textContent = msg;
+      if (formHint) formHint.textContent = msg;
+      return;
+    }
+    const c = control();
+    writeProbeActive = true;
+    updateWriteProbeBtn();
+    if (btnGripperInit) btnGripperInit.disabled = true;
+    const busy = t("control.writeProbeBusy");
+    if (writeProbeHint) writeProbeHint.textContent = busy;
+    if (formHint) formHint.textContent = busy;
+    // Exclusive backend probe — drop HTTP session so the serial port is free.
+    await stopStream({ quiet: true });
+    writeProbeActive = true;
+    updateWriteProbeBtn();
+    try {
+      const res = await fetch(`/api/probe/${encodeURIComponent(currentDevice.id)}/gripper/write`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          config: collectFormConfig(),
+          dry_run: dryRunEl.checked,
+          read_hz: prefs.hz,
+          write_hz: clampWriteHz(writeRateEl?.value ?? prefs.writeHz),
+          hz_min: prefs.hzMin,
+          hz_max: prefs.hzMax,
+          value_min: c.value_min ?? 0,
+          value_max: c.value_max ?? 0.637,
+          baseline_s: 1.5,
+          max_duration_s: 25,
+          sync_duration_s: 10,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      const probe = data.write_probe || {};
+      const maxHz = Number(probe.max_sync_write_hz);
+      if (Number.isFinite(maxHz) && maxHz > 0) {
+        const next = { writeHz: maxHz };
+        if (maxHz > prefs.hzMax) next.hzMax = Math.ceil(maxHz);
+        setRatePrefs(currentDevice.id, currentDevice.kind, next);
+        if (writeRateEl) writeRateEl.value = String(maxHz);
+        const cardHz = grid?.querySelector(`${cardSelector(currentDevice.id)} .card-hz`);
+        if (cardHz) cardHz.value = String(maxHz);
+        applyModalRateBounds();
+      }
+      updateGripperIoPanel({
+        readMeasuredHz: Number(probe.read_measured_hz) || null,
+        writeMeasuredHz: Number(probe.write_measured_hz) || null,
+        maxSyncWriteHz: Number.isFinite(maxHz) ? maxHz : null,
+        writeTargetHz: Number.isFinite(maxHz) ? maxHz : prefs.writeHz,
+      });
+      const msg =
+        Number.isFinite(maxHz) && maxHz > 0
+          ? t("control.writeProbeDone", { hz: formatMeasured(maxHz) })
+          : t("control.writeProbeAborted");
+      if (writeProbeHint) writeProbeHint.textContent = msg;
+      if (formHint) formHint.textContent = msg;
+    } catch (err) {
+      const msg = String(err.message || err);
+      if (writeProbeHint) writeProbeHint.textContent = msg;
+      if (formHint) formHint.textContent = msg;
+    } finally {
+      writeProbeActive = false;
+      updateWriteProbeBtn();
+      if (btnGripperInit) btnGripperInit.disabled = false;
+    }
+  }
+
+  async function resetDeviceConfig() {
+    if (!currentDevice?.id) return;
+    persistCurrentFormConfig();
+    if (currentDevice.kind === "realsense") {
+      currentDevice.config = { ...currentDevice.config, ...collectFormConfig() };
+      applyModalRateBounds();
+    }
+    formHint.textContent = t("form.resetting");
+    if (btnResetConfig) btnResetConfig.disabled = true;
+    try {
+      const payload = {
+        config: collectFormConfig(),
+        dry_run: dryRunEl.checked,
+      };
+      if (sessionId) {
+        const res = await fetch(`/api/session/${encodeURIComponent(sessionId)}/reset`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        if (data.config_used) {
+          currentDevice.config = { ...currentDevice.config, ...data.config_used };
+          saveDeviceConfig(currentDevice.id, data.config_used);
+        }
+        streamRateTimes = [];
+        streamMeasuredHz = null;
+        streamRateOk = null;
+        observeRate(streamRateTimes, clampHz(rateEl.value));
+        showViz(data);
+        syncSampleRateFromStreamFps(data.sample, data.config_used);
+        updateStreamStatus(data.tick);
+        formHint.textContent = t("form.resetDone");
+        if (streamTimer) armStreamTimer();
+      } else {
+        await sampleOnce();
+        formHint.textContent = t("form.resetDone");
+      }
+    } catch (err) {
+      formHint.textContent = String(err.message || err);
+    } finally {
+      if (btnResetConfig) btnResetConfig.disabled = false;
+    }
   }
 
   async function startStream() {
@@ -2060,6 +2625,9 @@
     formHint.textContent = t("form.opening");
     btnStart.disabled = true;
     try {
+      persistCurrentFormConfig();
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 45000);
       const res = await fetch(`/api/session/start/${encodeURIComponent(currentDevice.id)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2067,10 +2635,16 @@
           config: collectFormConfig(),
           dry_run: dryRunEl.checked,
         }),
+        signal: controller.signal,
       });
+      clearTimeout(timer);
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       sessionId = data.session_id;
+      if (data.config_used) {
+        currentDevice.config = { ...currentDevice.config, ...data.config_used };
+        saveDeviceConfig(currentDevice.id, data.config_used);
+      }
       streamStartedAt = Date.now();
       streamRecords = [];
       streamRecording = true;
@@ -2081,17 +2655,23 @@
       updateSaveStreamBtn();
       setStreamingUi(true);
       showViz(data);
+      syncSampleRateFromStreamFps(data.sample, data.config_used);
       updateStreamStatus(data.tick);
       formHint.textContent = t("form.streaming");
       armStreamTimer();
       if (currentDevice?.id) {
-        const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
-        setRatePrefs(currentDevice.id, currentDevice.kind, { hz: clampHz(rateEl.value) });
-        void prefs;
+        const patch = { hz: clampHz(rateEl.value) };
+        if (isGripperKind(currentDevice.kind) && writeRateEl) {
+          patch.writeHz = clampWriteHz(writeRateEl.value);
+        }
+        setRatePrefs(currentDevice.id, currentDevice.kind, patch);
       }
     } catch (err) {
-      formHint.textContent = String(err.message || err);
+      formHint.textContent =
+        err.name === "AbortError" ? t("form.openTimeout") : String(err.message || err);
       setStreamingUi(false);
+    } finally {
+      if (!sessionId) btnStart.disabled = false;
     }
   }
 
@@ -2100,6 +2680,7 @@
     formHint.textContent = t("form.onceBusy");
     btnOnce.disabled = true;
     try {
+      persistCurrentFormConfig();
       const res = await fetch(`/api/sample/${encodeURIComponent(currentDevice.id)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2110,7 +2691,12 @@
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      if (data.config_used) {
+        currentDevice.config = { ...currentDevice.config, ...data.config_used };
+        saveDeviceConfig(currentDevice.id, data.config_used);
+      }
       formHint.textContent = t("form.onceDone");
+      syncSampleRateFromStreamFps(data.sample, data.config_used);
       showViz(data);
       streamStatus.textContent = t("stream.once");
     } catch (err) {
@@ -2129,28 +2715,62 @@
     streamStatus.textContent = "";
     lastPayload = null;
     clearStreamRecords();
-    baseline = null;
     commandHint.textContent = "";
-    baselineHint.textContent = t("control.baselineNone");
+    if (gripperInitHint) gripperInitHint.textContent = t("control.gripperInitHint");
     try {
       const res = await fetch(`/api/device/${encodeURIComponent(id)}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       currentDevice = data;
+      currentDevice.config = mergeDeviceConfig(data.config, id);
       modalTitle.textContent = data.name || data.id;
       modalKind.textContent = `${data.kind} · ${data.id}`;
       dryRunEl.checked = !!data.dry_run_default;
       applyModalRateBounds();
+      syncGripperIoPanelVisibility();
 
       const fields = data.fields || [];
+      const cfgForForm = currentDevice.config;
       if (!fields.length) {
         formFields.innerHTML = `<p class="msg">${escapeHtml(t("form.noFields"))}</p>`;
       } else {
         formFields.innerHTML = fields
           .map((f) => {
-            const val = escapeHtml(fieldValue(data.config, f.key, f.as));
-            const inputType = f.type === "number" && f.as !== "int_list" ? "number" : "text";
             const label = fieldLabel(f.key, f.label);
+            if (f.type === "checkbox") {
+              const checked = configBool(cfgForForm, f.key, false) ? "checked" : "";
+              return `
+              <label class="field field-check">
+                <input name="${escapeHtml(f.key)}" type="checkbox" ${checked} data-as="${escapeHtml(f.as || "")}" />
+                <span class="field-label">${escapeHtml(label)}</span>
+              </label>
+            `;
+            }
+            if (f.type === "select") {
+              const optsList = (f.options || []).map((o) => String(o));
+              let cur = fieldValue(cfgForForm, f.key, f.as);
+              if (cur && !optsList.includes(cur) && optsList.length) {
+                const n = Number(cur);
+                cur = optsList.reduce((best, o) =>
+                  Math.abs(Number(o) - n) < Math.abs(Number(best) - n) ? o : best
+                );
+              }
+              if (!cur) cur = optsList.includes("15") ? "15" : optsList[0] || "";
+              const opts = optsList
+                .map((s) => {
+                  const sel = s === cur ? "selected" : "";
+                  return `<option value="${escapeHtml(s)}" ${sel}>${escapeHtml(s)}</option>`;
+                })
+                .join("");
+              return `
+              <label class="field">
+                <span class="field-label">${escapeHtml(label)}</span>
+                <select name="${escapeHtml(f.key)}" data-as="${escapeHtml(f.as || "")}">${opts}</select>
+              </label>
+            `;
+            }
+            const val = escapeHtml(fieldValue(cfgForForm, f.key, f.as));
+            const inputType = f.type === "number" && f.as !== "int_list" ? "number" : "text";
             return `
               <label class="field">
                 <span class="field-label">${escapeHtml(label)}</span>
@@ -2159,6 +2779,14 @@
             `;
           })
           .join("");
+        formFields.querySelectorAll("input[name], select[name]").forEach((input) => {
+          input.addEventListener("change", () => {
+            if (currentDevice?.kind === "realsense" && input.name === "fps") {
+              currentDevice.config = { ...currentDevice.config, ...collectFormConfig() };
+              applyModalRateBounds();
+            }
+          });
+        });
       }
       showControlPanel();
       formHint.textContent = control().writable ? t("form.hint.writable") : t("form.hint.sample");
@@ -2175,6 +2803,7 @@
   }
 
   async function closeModal() {
+    persistCurrentFormConfig();
     modal.hidden = true;
     await stopStream({ quiet: true });
   }
@@ -2240,25 +2869,54 @@
   btnStart.addEventListener("click", startStream);
   btnStop.addEventListener("click", () => stopStream());
   btnOnce.addEventListener("click", sampleOnce);
+  if (btnResetConfig) btnResetConfig.addEventListener("click", () => void resetDeviceConfig());
   btnSaveStream?.addEventListener("click", saveStreamFile);
-  btnCapture.addEventListener("click", captureBaseline);
-  btnRandomCmd.addEventListener("click", randomCommandOnce);
+  if (btnFixedCmd) btnFixedCmd.addEventListener("click", () => void fixedCommandOnce());
+  if (btnGripperInit) btnGripperInit.addEventListener("click", () => void calibrateGripper());
   rateEl.addEventListener("change", () => {
     rateEl.value = String(clampHz(rateEl.value));
+    const hz = clampHz(rateEl.value);
     if (currentDevice?.id) {
-      setRatePrefs(currentDevice.id, currentDevice.kind, { hz: clampHz(rateEl.value) });
-      const cardHz = grid?.querySelector(`${cardSelector(currentDevice.id)} .card-hz`);
-      if (cardHz) cardHz.value = rateEl.value;
+      setRatePrefs(currentDevice.id, currentDevice.kind, { hz });
+      if (!isGripperKind(currentDevice.kind)) {
+        const cardHz = grid?.querySelector(`${cardSelector(currentDevice.id)} .card-hz`);
+        if (cardHz) cardHz.value = String(hz);
+      } else if (modalGripper) {
+        modalGripper.readHz = hz;
+      }
     }
     if (sessionId) {
       streamRateTimes = [];
       streamMeasuredHz = null;
       streamRateOk = null;
-      armStreamTimer();
+      if (isGripperKind(currentDevice?.kind) && modalGripper) {
+        if (streamTimer) clearInterval(streamTimer);
+        streamTimer = setInterval(tickOnce, intervalMsForHz(hz));
+      } else {
+        armStreamTimer();
+      }
       updateStreamStatus();
-      formHint.textContent = t("form.rateChanged", { hz: clampHz(rateEl.value) });
+      formHint.textContent = t("form.rateChanged", { hz });
     }
   });
+
+  writeRateEl?.addEventListener("change", () => {
+    if (!currentDevice || !isGripperKind(currentDevice.kind)) return;
+    writeRateEl.value = String(clampWriteHz(writeRateEl.value));
+    const writeHz = clampWriteHz(writeRateEl.value);
+    setRatePrefs(currentDevice.id, currentDevice.kind, { writeHz });
+    const cardHz = grid?.querySelector(`${cardSelector(currentDevice.id)} .card-hz`);
+    if (cardHz) cardHz.value = String(writeHz);
+    if (modalGripper) {
+      modalGripper.writeHz = writeHz;
+    }
+  });
+
+  if (btnWriteProbe) {
+    btnWriteProbe.addEventListener("click", () => {
+      void runGripperWriteProbe();
+    });
+  }
 
   btnRefresh.addEventListener("click", probe);
   btnReload.addEventListener("click", reloadCfg);
@@ -2443,9 +3101,6 @@
       if (writable) showControlPanel();
       if (!sessionId && !lastPayload) {
         formHint.textContent = writable ? t("form.hint.writable") : t("form.hint.sample");
-        baselineHint.textContent = baseline
-          ? t("control.baselineCaptured", { vals: baseline.map((v) => v.toFixed(3)).join(", ") })
-          : t("control.baselineNone");
       } else if (lastPayload) {
         const wasRecording = streamRecording;
         streamRecording = false;

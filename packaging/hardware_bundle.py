@@ -12,6 +12,13 @@ HARDWARE_PACKAGES = (
     "zmq",
 )
 
+# Pure/binary packages that break when only .so files land on disk under _internal/
+# (numpy then raises the misleading "source directory" ImportError).
+CORE_PACKAGES = (
+    "numpy",
+    "PIL",
+)
+
 
 def extend_analysis(
     datas: list,
@@ -20,7 +27,7 @@ def extend_analysis(
 ) -> tuple[list, list, list]:
     """Collect datas/binaries/hiddenimports for hardware SDKs (required for desktop)."""
     missing: list[str] = []
-    for pkg in HARDWARE_PACKAGES:
+    for pkg in (*CORE_PACKAGES, *HARDWARE_PACKAGES):
         try:
             d, b, h = collect_all(pkg)
         except Exception as exc:  # noqa: BLE001
@@ -34,8 +41,18 @@ def extend_analysis(
         except Exception:  # noqa: BLE001
             pass
 
-    # Explicit lazy-import targets used by sensors drivers
+    # Explicit lazy-import targets used by sensors drivers / app
     hiddenimports += [
+        "numpy",
+        "numpy.__config__",
+        "numpy.version",
+        "numpy.core",
+        "numpy.core._multiarray_umath",
+        "numpy.linalg",
+        "numpy.fft",
+        "numpy.random",
+        "PIL",
+        "PIL.Image",
         "pyrealsense2",
         "dynamixel_sdk",
         "dynamixel_sdk.robotis_def",

@@ -68,15 +68,27 @@ CONNECT_FIELDS: dict[str, list[dict[str, Any]]] = {
         {"key": "port", "label": "串口路径", "type": "text"},
         {"key": "baudrate", "label": "波特率", "type": "number"},
         {"key": "slave_id", "label": "Slave ID", "type": "number"},
+        {"key": "default_force", "label": "夹持力", "type": "number"},
+        {"key": "default_speed", "label": "速度", "type": "number"},
+        {"key": "init_on_open", "label": "打开时初始化", "type": "checkbox", "as": "bool"},
+        {"key": "timeout_ms", "label": "串口超时 ms", "type": "number"},
     ],
     "realsense": [
         {"key": "serial", "label": "相机序列号", "type": "text"},
         {"key": "role", "label": "角色 left/right/middle", "type": "text"},
-        {"key": "width", "label": "宽度", "type": "number"},
-        {"key": "height", "label": "高度", "type": "number"},
-        {"key": "fps", "label": "帧率", "type": "number"},
+        {"key": "width", "label": "分辨率宽度", "type": "number"},
+        {"key": "height", "label": "分辨率高度", "type": "number"},
+        {
+            "key": "fps",
+            "label": "硬件帧率 (仅 6/15/30/60)",
+            "type": "select",
+            "options": [6, 15, 30, 60],
+        },
+        {"key": "enable_depth", "label": "深度图", "type": "checkbox", "as": "bool"},
+        {"key": "align_to_color", "label": "深度对齐彩色", "type": "checkbox", "as": "bool"},
         {"key": "exposure", "label": "曝光", "type": "number"},
         {"key": "gain", "label": "增益", "type": "number"},
+        {"key": "timeout_ms", "label": "取帧超时 ms", "type": "number"},
     ],
     "pipeline": [
         {"key": "flag_shm", "label": "flag SHM", "type": "text"},
@@ -84,8 +96,14 @@ CONNECT_FIELDS: dict[str, list[dict[str, Any]]] = {
         {"key": "joint_shm", "label": "joint SHM", "type": "text"},
     ],
     "ft": [
-        {"key": "endpoint", "label": "端点", "type": "text"},
-        {"key": "backend", "label": "后端 stub", "type": "text"},
+        {"key": "port", "label": "串口 (Windows: COM5)", "type": "text"},
+        {
+            "key": "port_substr",
+            "label": "by-id 子串 (可选，仅 port 为空时 Linux 自动匹配)",
+            "type": "text",
+        },
+        {"key": "baudrate", "label": "波特率", "type": "number"},
+        {"key": "timeout_ms", "label": "读帧超时 ms", "type": "number"},
     ],
     "tactile": [
         {"key": "dll_path", "label": "DLL 路径 (ReadPaxiniLib)", "type": "text"},
@@ -116,6 +134,10 @@ class SampleRequest(BaseModel):
     dry_run: bool | None = None
 
 
+class TickRequest(BaseModel):
+    command: dict[str, Any] | None = None
+
+
 class CommandRequest(BaseModel):
     command: dict[str, Any] = Field(default_factory=dict)
     config: dict[str, Any] = Field(default_factory=dict)
@@ -142,6 +164,21 @@ class UserUpdateBody(BaseModel):
     role: str | None = None
     enabled: bool | None = None
     password: str | None = None
+
+
+class GripperWriteProbeRequest(BaseModel):
+    config: dict[str, Any] = Field(default_factory=dict)
+    dry_run: bool | None = None
+    read_hz: float = 8.0
+    write_hz: float = 8.0
+    hz_min: float = 1.0
+    hz_max: float = 200.0
+    value_min: float = 0.0
+    value_max: float = 0.637
+    baseline_s: float = 1.5
+    max_duration_s: float = 25.0
+    sync_duration_s: float = 10.0
+    read_duration_s: float = 10.0
 
 
 class ExportDirBody(BaseModel):
@@ -411,6 +448,17 @@ def _build_viz(kind: str, sample: dict[str, Any], *, dry_run: bool, tick: int = 
             viz["metrics"].append({"label": "serial", "value": str(sample.get("serial"))})
         if sample.get("role"):
             viz["metrics"].append({"label": "role", "value": str(sample.get("role"))})
+        for k in ("width", "height", "fps", "fps_requested", "enable_depth", "align_to_color"):
+            if k in sample:
+                viz["metrics"].append({"label": k, "value": str(sample.get(k))})
+        if sample.get("fps_requested") and sample.get("fps") and sample.get("fps_requested") != sample.get("fps"):
+            viz["note"] = (
+                viz.get("note")
+                or (
+                    f"相机硬件帧率回退: 请求 {sample.get('fps_requested')} → 实际 {sample.get('fps')} "
+                    f"(RealSense 仅支持离散帧率，常见 6/15/30/60)"
+                )
+            )
 
     elif kind == "bus":
         for k in ("local_pty", "pty_exists", "socat_running", "proc_alive", "robot"):
@@ -478,7 +526,8 @@ def _build_viz(kind: str, sample: dict[str, Any], *, dry_run: bool, tick: int = 
                         "label": "bias T",
                         "value": ", ".join(f"{float(v):.3f}" for v in list(bias)[3:6]),
                     },
-                    {"label": "endpoint", "value": str(sample.get("endpoint", "—"))},
+                    {"label": "backend", "value": "serial"},
+                    {"label": "port", "value": str(sample.get("port", "—"))},
                 ]
             )
         elif dry_run:
@@ -575,25 +624,28 @@ def _coerce_overrides(kind: str, raw: dict[str, Any]) -> dict[str, Any]:
             else:
                 parts = [p.strip() for p in str(v).split(",") if p.strip()]
                 out[k] = [int(p) for p in parts]
+        elif ftype == "checkbox" or as_type == "bool":
+            if isinstance(v, bool):
+                out[k] = v
+            else:
+                out[k] = str(v).lower() in ("1", "true", "on", "yes")
         elif ftype == "number":
             if v == "" or v is None:
                 continue
             num = float(v)
             out[k] = int(num) if num.is_integer() else num
+        elif ftype == "select":
+            if v == "" or v is None:
+                continue
+            opts = meta.get("options") or []
+            if opts and all(isinstance(o, (int, float)) for o in opts):
+                num = float(v)
+                out[k] = int(num) if num.is_integer() else num
+            else:
+                out[k] = v
         else:
             out[k] = v
     return out
-
-
-def _as_float_list(value: Any, n: int, default: float) -> list[float]:
-    if isinstance(value, (list, tuple)) and value:
-        out = [float(x) for x in value[:n]]
-        while len(out) < n:
-            out.append(default)
-        return out
-    if isinstance(value, (int, float)):
-        return [float(value)] * n
-    return [float(default)] * n
 
 
 def _control_schema(kind: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -605,35 +657,18 @@ def _control_schema(kind: str, config: dict[str, Any]) -> dict[str, Any]:
             "num_dofs": n,
             "labels": [f"j{i + 1}" for i in range(n)],
             "unit": "rad",
-            "default_delta": 0.05,
-            "min_delta": 0.0,
-            "max_delta": 0.5,
-            # display = read_scale * raw + read_offset
-            "read_scale": _as_float_list(config.get("read_scale"), n, 1.0),
-            "read_offset": _as_float_list(config.get("read_offset"), n, 0.0),
-            # real = write_scale * display + write_offset
-            "write_scale": _as_float_list(config.get("write_scale"), n, 1.0),
-            "write_offset": _as_float_list(config.get("write_offset"), n, 0.0),
-            "hint": "生数据→显示、显示→真实下发均为每自由度 scale·x+offset（scale/offset 为浮点，scale 可为负）",
+            "hint": "关节角直接读写（无 scale/offset）",
         }
     if kind == "gripper":
-        n = 1
         return {
             "writable": True,
             "mode": "gripper",
-            "num_dofs": n,
+            "num_dofs": 1,
             "labels": ["open"],
             "unit": "norm",
             "value_min": 0.0,
             "value_max": 0.637,
-            "default_delta": 0.05,
-            "min_delta": 0.0,
-            "max_delta": 0.3,
-            "read_scale": _as_float_list(config.get("read_scale"), n, 1.0),
-            "read_offset": _as_float_list(config.get("read_offset"), n, 0.0),
-            "write_scale": _as_float_list(config.get("write_scale"), n, 1.0),
-            "write_offset": _as_float_list(config.get("write_offset"), n, 0.0),
-            "hint": "夹爪同样：显示=rs·raw+ro；真实下发=ws·显示+wo（浮点，scale 可为负）",
+            "hint": "夹爪开合直接读写 position_norm（无 scale/offset）",
         }
     return {"writable": False}
 
@@ -687,6 +722,114 @@ def _close_sessions_for_sensor(sensor_id: str) -> None:
         doomed = [sid for sid, s in _sessions.items() if s.sensor_id == sensor_id]
         for sid in doomed:
             _close_session_locked(sid)
+
+
+def _gripper_probe_script_path(mode: str | None = None) -> Path:
+    m = str(mode or "").strip().lower()
+    if m == "read":
+        return ROOT / "scripts" / "probe_gripper_read_rate.py"
+    if m == "write":
+        return ROOT / "scripts" / "probe_gripper_write_rate.py"
+    # calibrate / init / generic
+    return ROOT / "scripts" / "probe_gripper_rate.py"
+
+
+def _run_gripper_probe_script(job: dict[str, Any], *, timeout_s: float = 180.0) -> dict[str, Any]:
+    """
+    Start the dedicated probe script on a worker thread and wait for its JSON result.
+
+    Prefer subprocess so probing is isolated from the HTTP worker; fall back to
+    importing app.gripper_rate_probe.run_job in that thread.
+    """
+    import json
+    import os
+    import subprocess
+    import tempfile
+
+    sensor_id = str(job.get("sensor_id") or "")
+    if sensor_id:
+        _close_sessions_for_sensor(sensor_id)
+
+    box: dict[str, Any] = {"result": None, "error": None}
+    script = _gripper_probe_script_path(str(job.get("mode") or ""))
+
+    def worker() -> None:
+        try:
+            if script.is_file() and not getattr(sys, "frozen", False):
+                with tempfile.TemporaryDirectory(prefix="sv-probe-") as td:
+                    job_path = Path(td) / "job.json"
+                    out_path = Path(td) / "out.json"
+                    job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+                    env = os.environ.copy()
+                    pp = [str(SENSORS_SRC), str(ROOT)]
+                    if env.get("PYTHONPATH"):
+                        pp.append(env["PYTHONPATH"])
+                    env["PYTHONPATH"] = os.pathsep.join(pp)
+                    proc = subprocess.run(
+                        [
+                            sys.executable,
+                            str(script),
+                            "--job",
+                            str(job_path),
+                            "--out",
+                            str(out_path),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_s,
+                        env=env,
+                        cwd=str(ROOT),
+                    )
+                    raw = ""
+                    if out_path.is_file():
+                        raw = out_path.read_text(encoding="utf-8")
+                    elif proc.stdout.strip():
+                        raw = proc.stdout
+                    if not raw.strip():
+                        box["error"] = (proc.stderr or "").strip() or f"probe script exit {proc.returncode}"
+                        return
+                    data = json.loads(raw)
+                    if proc.returncode != 0 and not data.get("ok"):
+                        box["error"] = data.get("error") or (proc.stderr or "").strip() or f"exit {proc.returncode}"
+                    box["result"] = data
+                    return
+
+            from .gripper_rate_probe import run_job
+
+            box["result"] = run_job(job)
+        except subprocess.TimeoutExpired:
+            box["error"] = f"probe script timed out after {timeout_s:.0f}s"
+        except Exception as e:  # noqa: BLE001
+            box["error"] = str(e)
+
+    thread = threading.Thread(
+        target=worker,
+        name=f"gripper-probe-{job.get('mode')}-{sensor_id or 'x'}",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=timeout_s + 5.0)
+    if thread.is_alive():
+        raise HTTPException(status_code=504, detail="probe worker thread still running (timeout)")
+    if box["result"] is None:
+        raise HTTPException(status_code=500, detail=box["error"] or "probe returned no result")
+    result = dict(box["result"])
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=result.get("error") or box["error"] or "probe failed")
+    return result
+
+
+def _gripper_probe_base(sensor_id: str, body: GripperWriteProbeRequest) -> tuple[dict[str, Any], bool]:
+    mgr = get_manager()
+    if sensor_id not in mgr.ids():
+        raise HTTPException(status_code=404, detail=f"unknown sensor: {sensor_id}")
+    base = mgr.get(sensor_id)
+    if base.kind.value != "gripper":
+        raise HTTPException(status_code=400, detail="probe is for gripper only")
+    overrides = _coerce_overrides("gripper", body.config or {})
+    merged = {**base.config, **overrides}
+    dry_run = mgr.ctx.dry_run if body.dry_run is None else bool(body.dry_run)
+    return merged, dry_run
 
 
 @app.on_event("startup")
@@ -1167,29 +1310,77 @@ def api_session_start(sensor_id: str, body: SampleRequest) -> dict[str, Any]:
     )
 
 
-@app.post("/api/session/{session_id}/tick")
-def api_session_tick(session_id: str) -> dict[str, Any]:
+@app.post("/api/session/{session_id}/reset")
+def api_session_reset(session_id: str, body: SampleRequest) -> dict[str, Any]:
+    """Close and reopen the session sensor with merged form config (e.g. RealSense fps)."""
+    mgr = get_manager()
     with _sessions_lock:
         sess = _sessions.get(session_id)
-    if sess is None:
-        raise HTTPException(status_code=404, detail="session not found or already stopped")
-    try:
-        sample = dict(sess.sensor.read())
-    except Exception as e:  # noqa: BLE001
-        with _sessions_lock:
+        if sess is None:
+            raise HTTPException(status_code=404, detail="session not found or already stopped")
+        kind = sess.kind
+        overrides = _coerce_overrides(kind, body.config or {})
+        merged = {**sess.config_used, **overrides}
+        dry_run = sess.dry_run if body.dry_run is None else bool(body.dry_run)
+        try:
+            sess.sensor.close()
+        except Exception:  # noqa: BLE001
+            pass
+        base = mgr.get(sess.sensor_id)
+        sensor = type(base)(sess.sensor_id, merged, SensorContext(dry_run=dry_run))
+        try:
+            sensor.open()
+            sample = dict(sensor.read())
+        except Exception as e:  # noqa: BLE001
             _close_session_locked(session_id)
-        raise HTTPException(status_code=500, detail=str(e)) from e
-    sess.tick += 1
-    return _pack_sample_response(
-        sensor_id=sess.sensor_id,
-        kind=sess.kind,
-        name=sess.name,
-        dry_run=sess.dry_run,
-        config_used=sess.config_used,
-        sample=sample,
-        tick=sess.tick,
-        session_id=session_id,
-    )
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        sess.sensor = sensor
+        sess.config_used = _public_config(merged)
+        sess.dry_run = dry_run
+        sess.tick = 1
+        pack = _pack_sample_response(
+            sensor_id=sess.sensor_id,
+            kind=sess.kind,
+            name=sess.name,
+            dry_run=sess.dry_run,
+            config_used=sess.config_used,
+            sample=sample,
+            tick=sess.tick,
+            session_id=session_id,
+        )
+    return pack
+
+
+@app.post("/api/session/{session_id}/tick")
+def api_session_tick(session_id: str, body: TickRequest | None = None) -> dict[str, Any]:
+    req = body or TickRequest()
+    with _sessions_lock:
+        sess = _sessions.get(session_id)
+        if sess is None:
+            raise HTTPException(status_code=404, detail="session not found or already stopped")
+        try:
+            command_result: dict[str, Any] | None = None
+            if req.command:
+                command_result = dict(sess.sensor.write(req.command))
+            sample = dict(sess.sensor.read())
+        except Exception as e:  # noqa: BLE001
+            _close_session_locked(session_id)
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        sess.tick += 1
+        tick = sess.tick
+        pack = _pack_sample_response(
+            sensor_id=sess.sensor_id,
+            kind=sess.kind,
+            name=sess.name,
+            dry_run=sess.dry_run,
+            config_used=sess.config_used,
+            sample=sample,
+            tick=tick,
+            session_id=session_id,
+        )
+    if command_result is not None:
+        pack["command_result"] = command_result
+    return pack
 
 
 @app.post("/api/session/{session_id}/stop")
@@ -1205,21 +1396,102 @@ def api_session_stop(session_id: str) -> dict[str, Any]:
 def api_session_command(session_id: str, body: CommandRequest) -> dict[str, Any]:
     with _sessions_lock:
         sess = _sessions.get(session_id)
-    if sess is None:
-        raise HTTPException(status_code=404, detail="session not found or already stopped")
-    if not (_control_schema(sess.kind, sess.config_used).get("writable")):
-        raise HTTPException(status_code=400, detail=f"{sess.kind} does not support write")
-    try:
-        result = dict(sess.sensor.write(body.command or {}))
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        if sess is None:
+            raise HTTPException(status_code=404, detail="session not found or already stopped")
+        if not (_control_schema(sess.kind, sess.config_used).get("writable")):
+            raise HTTPException(status_code=400, detail=f"{sess.kind} does not support write")
+        try:
+            result = dict(sess.sensor.write(body.command or {}))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        sid = sess.sensor_id
+        kind = sess.kind
     return {
         "ok": True,
         "session_id": session_id,
-        "id": sess.sensor_id,
-        "kind": sess.kind,
+        "id": sid,
+        "kind": kind,
         "command_result": result,
     }
+
+
+@app.post("/api/probe/{sensor_id}/gripper/calibrate")
+def api_probe_gripper_calibrate(sensor_id: str, body: GripperWriteProbeRequest) -> dict[str, Any]:
+    """Calibration only — dedicated probe script (mode=calibrate)."""
+    merged, dry_run = _gripper_probe_base(sensor_id, body)
+    return _run_gripper_probe_script(
+        {
+            "mode": "calibrate",
+            "sensor_id": sensor_id,
+            "config": merged,
+            "dry_run": dry_run,
+        },
+        timeout_s=180.0,
+    )
+
+
+@app.post("/api/probe/{sensor_id}/gripper/init")
+def api_probe_gripper_init(sensor_id: str, body: GripperWriteProbeRequest) -> dict[str, Any]:
+    """Compat: calibrate script then read-rate script (two separate script launches)."""
+    cal = api_probe_gripper_calibrate(sensor_id, body)
+    cfg = dict(cal.get("config_used") or {})
+    # Re-run read with calibrated raw min/max in config.
+    body2 = GripperWriteProbeRequest(
+        config={**(body.config or {}), **cfg},
+        dry_run=body.dry_run,
+        read_duration_s=body.read_duration_s,
+    )
+    read = api_probe_gripper_read(sensor_id, body2)
+    return {
+        "ok": True,
+        "id": sensor_id,
+        "kind": "gripper",
+        "dry_run": read.get("dry_run"),
+        "config_used": cfg or read.get("config_used"),
+        "command_result": cal.get("command_result") or {},
+        "read_probe": (read.get("read_probe") or {}),
+        "via": "calibrate_script+read_script",
+    }
+
+
+@app.post("/api/probe/{sensor_id}/gripper/read")
+def api_probe_gripper_read(sensor_id: str, body: GripperWriteProbeRequest) -> dict[str, Any]:
+    """Max-read probe only — dedicated read-rate script on a worker thread."""
+    merged, dry_run = _gripper_probe_base(sensor_id, body)
+    return _run_gripper_probe_script(
+        {
+            "mode": "read",
+            "sensor_id": sensor_id,
+            "config": merged,
+            "dry_run": dry_run,
+            "read_duration_s": float(body.read_duration_s or 10.0),
+        },
+        timeout_s=60.0,
+    )
+
+
+@app.post("/api/probe/{sensor_id}/gripper/write")
+def api_probe_gripper_write(sensor_id: str, body: GripperWriteProbeRequest) -> dict[str, Any]:
+    """Max sync write probe via dedicated write-rate script on a worker thread."""
+    merged, dry_run = _gripper_probe_base(sensor_id, body)
+    return _run_gripper_probe_script(
+        {
+            "mode": "write",
+            "sensor_id": sensor_id,
+            "config": merged,
+            "dry_run": dry_run,
+            "read_hz": float(body.read_hz),
+            "write_hz": float(body.write_hz),
+            "hz_min": float(body.hz_min),
+            "hz_max": float(body.hz_max),
+            "value_min": float(body.value_min),
+            "value_max": float(body.value_max),
+            "baseline_s": float(body.baseline_s),
+            "max_duration_s": float(body.max_duration_s),
+            "sync_duration_s": float(body.sync_duration_s or 10.0),
+        },
+        timeout_s=120.0,
+    )
 
 
 @app.post("/api/command/{sensor_id}")

@@ -197,5 +197,9 @@ def ensure_runtime_env(*, desktop: bool = False) -> Path:
         sys.path.insert(0, str(src))
 
     if desktop or is_frozen():
-        os.chdir(data)
+        # Never chdir into a tree that could shadow site-packages (e.g. a local
+        # numpy/ checkout). Prefer an explicit empty workdir under user data.
+        work = data / "run"
+        work.mkdir(parents=True, exist_ok=True)
+        os.chdir(work)
     return data
