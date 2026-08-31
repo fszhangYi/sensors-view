@@ -194,7 +194,17 @@ def ensure_runtime_env(*, desktop: bool = False) -> Path:
 
     src = sensors_src_dir()
     if src.is_dir() and str(src) not in sys.path:
-        sys.path.insert(0, str(src))
+        # Keep _MEIPASS ahead of sensors_src so bundled numpy/PIL win over any
+        # on-disk trees that might appear under the sensors checkout.
+        mp = meipass()
+        if mp is not None:
+            mps = str(mp)
+            if mps in sys.path:
+                sys.path.remove(mps)
+            sys.path.insert(0, mps)
+            sys.path.insert(1, str(src))
+        else:
+            sys.path.insert(0, str(src))
 
     if desktop or is_frozen():
         # Never chdir into a tree that could shadow site-packages (e.g. a local

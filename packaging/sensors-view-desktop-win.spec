@@ -79,13 +79,13 @@ datas, binaries, hiddenimports = extend_analysis(datas, binaries, hiddenimports)
 
 a = Analysis(
     [str(APP / "desktop_main.py")],
-    pathex=[str(ROOT), str(SENSORS_SRC) if SENSORS_SRC.is_dir() else str(ROOT)],
+    pathex=[str(SENSORS_SRC)] if SENSORS_SRC.is_dir() else [],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(ROOT / "packaging" / "runtime_hook_path.py")],
     excludes=["tkinter", "matplotlib", "PySide2", "PySide6", "PyQt5", "PyQt6"],
     noarchive=False,
     module_collection_mode={

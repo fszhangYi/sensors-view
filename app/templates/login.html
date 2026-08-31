@@ -24,10 +24,25 @@
       } catch (e) { /* ignore */ }
     })();
   </script>
-  <link rel="stylesheet" href="/static/fonts.css?v=40" />
+  <style>
+    /* Critical boot CSS — no network; prevents black→white flash before stylesheets */
+    html, body {
+      margin: 0;
+      background: #0b1018;
+      color: #e7ecf3;
+      color-scheme: dark;
+      font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .auth-boot, .login-boot-host {
+      min-height: 100vh;
+      background: #0b1018;
+      color: #8b9bb4;
+    }
+  </style>
+  <link rel="stylesheet" href="/static/fonts.css?v=64" />
   <link rel="icon" href="/static/assets/favicon.svg" type="image/svg+xml" />
-  <link rel="stylesheet" href="/static/style.css?v=40" />
-  <link rel="stylesheet" href="/static/login.css?v=40" />
+  <link rel="stylesheet" href="/static/style.css?v=64" />
+  <link rel="stylesheet" href="/static/login.css?v=64" />
 </head>
 <body class="login-boot-host">
   <div id="auth-boot" class="auth-boot" role="status" aria-live="polite">
@@ -86,8 +101,8 @@
     </footer>
   </div>
 
-  <script src="/static/i18n.js?v=40"></script>
-  <script src="/static/appearance.js?v=40"></script>
-  <script src="/static/login.js?v=40"></script>
+  <script src="/static/i18n.js?v=64"></script>
+  <script src="/static/appearance.js?v=64"></script>
+  <script src="/static/login.js?v=64"></script>
 </body>
 </html>

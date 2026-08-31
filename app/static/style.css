@@ -511,7 +511,7 @@ main {
   padding: 0.4rem 0.45rem;
   border: 1px solid var(--border);
   border-radius: calc(var(--radius) - 2px);
-  background: color-mix(in srgb, var(--chrome) 70%, transparent);
+  background: rgba(26, 35, 50, 0.62);
 }
 .card-rate-io {
   grid-template-columns: 1fr 1fr;
@@ -682,7 +682,7 @@ main {
   flex-direction: column;
   gap: 0.4rem;
   padding: 0.55rem 0.5rem;
-  background: color-mix(in srgb, var(--chrome) 88%, #000 12%);
+  background: rgba(22, 30, 44, 0.96);
   border-right: 1px solid var(--border);
   overflow: hidden;
   min-height: 0;
@@ -1217,9 +1217,9 @@ main {
   gap: 0.55rem;
   margin: 0.75rem 0 0.85rem;
   padding: 0.75rem 0.85rem;
-  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+  border: 1px solid rgba(61, 214, 198, 0.35);
   border-radius: 10px;
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  background: rgba(61, 214, 198, 0.08);
 }
 .gripper-init-row .form-hint {
   flex: 1 1 12rem;

@@ -89,6 +89,23 @@ def _start_webview(url: str) -> bool:
 
 
 def main() -> None:
+    # Frozen: prove numpy before app import so path/lib failures are explicit.
+    if getattr(sys, "frozen", False):
+        try:
+            import numpy as _np  # noqa: F401
+        except Exception as exc:  # noqa: BLE001
+            meipass = getattr(sys, "_MEIPASS", "?")
+            print(
+                "[sensors-view] numpy import failed in frozen bundle.\n"
+                f"  _MEIPASS={meipass}\n"
+                f"  cwd={os.getcwd()}\n"
+                f"  cause={exc!r}\n"
+                "  (numpy's 'source directory' message usually means a missing "
+                "_multiarray_umath/.so or cwd inside …/_internal/numpy)",
+                file=sys.stderr,
+            )
+            raise SystemExit(2) from exc
+
     # 1) env before importing settings / app
     from app.paths import ensure_runtime_env, default_view_config
 

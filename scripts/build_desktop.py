@@ -409,6 +409,26 @@ def build_native(*, skip_frontend: bool = True) -> Path:
         raise SystemExit(f"missing binary: {entry}")
     entry.chmod(entry.stat().st_mode | 0o111)
 
+    # Smoke: import numpy from the onedir tree the same way a bad cwd would break it.
+    internal = built / "_internal"
+    if not (internal / "numpy" / "__init__.py").is_file():
+        raise SystemExit(f"bundled numpy missing under {internal}")
+    if not (internal / "numpy.libs").is_dir() and not list(internal.glob("libopenblas*")):
+        print("[warn] numpy.libs / openblas not found — native import may fail on some hosts", flush=True)
+    verify_env = os.environ.copy()
+    verify_env["SENSORS_VIEW_BROWSER"] = "1"
+    verify_env["SENSORS_VIEW_PORT"] = "0"  # unused; we only import
+    code = (
+        "import os,sys;"
+        f"sys.path.insert(0, r'{internal}');"
+        "os.chdir('/tmp');"
+        "import numpy;"
+        "print('numpy_ok', numpy.__version__, numpy.__file__);"
+        "import numpy.core._multiarray_umath as u;"
+        "print('umath_ok', getattr(u,'__file__',u))"
+    )
+    _run([py, "-c", code], env=verify_env)
+
     stamp = _utc_stamp()
     plat = _platform_tag()
     release = ROOT / "release" / f"{APP_ID}-desktop-{plat}-{stamp}"
@@ -446,7 +466,9 @@ def build_native(*, skip_frontend: bool = True) -> Path:
                 "8. Default dry_run=true; edit configs/view.yaml under the data dir after first run",
                 "9. Hardware SDKs bundled: pyrealsense2, dynamixel-sdk, pyserial, pyzmq",
                 "   (udev rules / vendor drivers may still be required on the host)",
-                "10. Desktop uses pywebview (GTK/Qt WebKit). Blank window → SENSORS_VIEW_BROWSER=1",
+                "10. Desktop uses pywebview (GTK/Qt WebKit). Blank/broken styles → SENSORS_VIEW_BROWSER=1",
+                "11. Run ./sensors-view from this folder (do not chdir into _internal/numpy)",
+                "12. UI CSS/fonts are local under _internal/app/static (no CDN)",
                 "",
             ]
         ),

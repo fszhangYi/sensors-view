@@ -33,6 +33,21 @@ def extend_analysis(
         except Exception as exc:  # noqa: BLE001
             missing.append(f"{pkg} ({exc})")
             continue
+        # Drop bulky / risky numpy test trees from datas (keeps package importable).
+        if pkg == "numpy":
+            d = [
+                item
+                for item in d
+                if not any(
+                    part in str(item[0]).replace("\\", "/")
+                    for part in (
+                        "/numpy/tests/",
+                        "/numpy/_core/tests/",
+                        "/numpy/f2py/tests/",
+                        "/numpy/typing/tests/",
+                    )
+                )
+            ]
         datas += d
         binaries += b
         hiddenimports += h
