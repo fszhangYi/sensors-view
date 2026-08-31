@@ -734,12 +734,19 @@ def _gripper_probe_script_path(mode: str | None = None) -> Path:
     return ROOT / "scripts" / "probe_gripper_rate.py"
 
 
-def _run_gripper_probe_script(job: dict[str, Any], *, timeout_s: float = 180.0) -> dict[str, Any]:
+def _run_probe_script(
+    script: Path,
+    job: dict[str, Any],
+    *,
+    timeout_s: float = 180.0,
+    fallback_run_job: Any = None,
+    thread_name: str = "probe",
+) -> dict[str, Any]:
     """
-    Start the dedicated probe script on a worker thread and wait for its JSON result.
+    Start a dedicated probe script on a worker thread and wait for its JSON result.
 
     Prefer subprocess so probing is isolated from the HTTP worker; fall back to
-    importing app.gripper_rate_probe.run_job in that thread.
+    an in-process run_job callable in that thread (frozen builds).
     """
     import json
     import os
@@ -751,7 +758,6 @@ def _run_gripper_probe_script(job: dict[str, Any], *, timeout_s: float = 180.0) 
         _close_sessions_for_sensor(sensor_id)
 
     box: dict[str, Any] = {"result": None, "error": None}
-    script = _gripper_probe_script_path(str(job.get("mode") or ""))
 
     def worker() -> None:
         try:
@@ -794,9 +800,10 @@ def _run_gripper_probe_script(job: dict[str, Any], *, timeout_s: float = 180.0) 
                     box["result"] = data
                     return
 
-            from .gripper_rate_probe import run_job
-
-            box["result"] = run_job(job)
+            if fallback_run_job is None:
+                box["error"] = "probe script missing and no in-process fallback"
+                return
+            box["result"] = fallback_run_job(job)
         except subprocess.TimeoutExpired:
             box["error"] = f"probe script timed out after {timeout_s:.0f}s"
         except Exception as e:  # noqa: BLE001
@@ -804,7 +811,7 @@ def _run_gripper_probe_script(job: dict[str, Any], *, timeout_s: float = 180.0) 
 
     thread = threading.Thread(
         target=worker,
-        name=f"gripper-probe-{job.get('mode')}-{sensor_id or 'x'}",
+        name=f"{thread_name}-{job.get('mode') or 'x'}-{sensor_id or 'x'}",
         daemon=True,
     )
     thread.start()
@@ -819,6 +826,18 @@ def _run_gripper_probe_script(job: dict[str, Any], *, timeout_s: float = 180.0) 
     return result
 
 
+def _run_gripper_probe_script(job: dict[str, Any], *, timeout_s: float = 180.0) -> dict[str, Any]:
+    from .gripper_rate_probe import run_job as gripper_run_job
+
+    return _run_probe_script(
+        _gripper_probe_script_path(str(job.get("mode") or "")),
+        job,
+        timeout_s=timeout_s,
+        fallback_run_job=gripper_run_job,
+        thread_name="gripper-probe",
+    )
+
+
 def _gripper_probe_base(sensor_id: str, body: GripperWriteProbeRequest) -> tuple[dict[str, Any], bool]:
     mgr = get_manager()
     if sensor_id not in mgr.ids():
@@ -830,6 +849,34 @@ def _gripper_probe_base(sensor_id: str, body: GripperWriteProbeRequest) -> tuple
     merged = {**base.config, **overrides}
     dry_run = mgr.ctx.dry_run if body.dry_run is None else bool(body.dry_run)
     return merged, dry_run
+
+
+class ReadRateProbeRequest(BaseModel):
+    config: dict[str, Any] = Field(default_factory=dict)
+    dry_run: bool | None = None
+    duration_s: float | None = None
+    read_duration_s: float | None = None
+
+
+def _read_rate_probe_base(sensor_id: str, body: ReadRateProbeRequest) -> tuple[Any, dict[str, Any], bool, float]:
+    from .read_rate_probe import SUPPORTED_KINDS, default_duration_s
+
+    mgr = get_manager()
+    if sensor_id not in mgr.ids():
+        raise HTTPException(status_code=404, detail=f"unknown sensor: {sensor_id}")
+    base = mgr.get(sensor_id)
+    kind = base.kind.value
+    if kind == "arm":
+        raise HTTPException(status_code=400, detail="read-rate probe not enabled for arm yet")
+    if kind not in SUPPORTED_KINDS:
+        raise HTTPException(status_code=400, detail=f"read-rate probe not supported for kind={kind}")
+    overrides = _coerce_overrides(kind, body.config or {})
+    merged = {**base.config, **overrides}
+    dry_run = mgr.ctx.dry_run if body.dry_run is None else bool(body.dry_run)
+    duration = body.duration_s if body.duration_s is not None else body.read_duration_s
+    if duration is None:
+        duration = default_duration_s(kind)
+    return base, merged, dry_run, float(duration)
 
 
 @app.on_event("startup")
@@ -1491,6 +1538,31 @@ def api_probe_gripper_write(sensor_id: str, body: GripperWriteProbeRequest) -> d
             "sync_duration_s": float(body.sync_duration_s or 10.0),
         },
         timeout_s=120.0,
+    )
+
+
+@app.post("/api/probe/{sensor_id}/read-rate")
+def api_probe_read_rate(sensor_id: str, body: ReadRateProbeRequest) -> dict[str, Any]:
+    """Offline max-read probe for non-arm streaming sensors (ft/tactile/realsense/gello/gripper)."""
+    from .read_rate_probe import run_job as read_rate_run_job
+
+    base, merged, dry_run, duration = _read_rate_probe_base(sensor_id, body)
+    kind = base.kind.value
+    # RealSense frame wait can be slow; allow headroom beyond duration.
+    timeout_s = max(60.0, duration + 30.0)
+    return _run_probe_script(
+        ROOT / "scripts" / "probe_read_rate.py",
+        {
+            "mode": "read",
+            "kind": kind,
+            "sensor_id": sensor_id,
+            "config": merged,
+            "dry_run": dry_run,
+            "duration_s": duration,
+        },
+        timeout_s=timeout_s,
+        fallback_run_job=read_rate_run_job,
+        thread_name="read-rate-probe",
     )
 
 

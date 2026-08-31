@@ -77,6 +77,9 @@
   const btnFixedCmd = document.getElementById("btn-fixed-cmd");
   const btnWriteProbe = document.getElementById("btn-write-probe");
   const writeProbeHint = document.getElementById("write-probe-hint");
+  const readProbeRow = document.getElementById("read-probe-row");
+  const btnReadProbe = document.getElementById("btn-read-probe");
+  const readProbeHint = document.getElementById("read-probe-hint");
 
   const RATE_PREFS_KEY = "sensors-view.ratePrefs";
   const CONNECT_CFG_KEY = "sensors-view.connectConfig";
@@ -344,7 +347,7 @@
     if (!Number.isFinite(readCapHz) || readCapHz <= 0) readCapHz = null;
     else readCapHz = Math.min(hzMax, Math.max(hzMin, readCapHz));
     const readMax =
-      isGripperKind(kind) && readCapHz != null ? Math.min(hzMax, readCapHz) : hzMax;
+      supportsReadCap(kind) && readCapHz != null ? Math.min(hzMax, readCapHz) : hzMax;
     if (!Number.isFinite(hz)) hz = def.defaultHz;
     hz = Math.min(readMax, Math.max(hzMin, hz));
     if (!Number.isFinite(writeHz)) writeHz = isGripperKind(kind) ? Math.min(hzMax, Math.max(hzMin, def.defaultHz)) : hz;
@@ -365,7 +368,7 @@
     else readCapHz = Math.min(next.hzMax, Math.max(next.hzMin, readCapHz));
     next.readCapHz = readCapHz;
     const readMax =
-      isGripperKind(kind) && readCapHz != null ? Math.min(next.hzMax, readCapHz) : next.hzMax;
+      supportsReadCap(kind) && readCapHz != null ? Math.min(next.hzMax, readCapHz) : next.hzMax;
     next.hz = Math.min(readMax, Math.max(next.hzMin, Number(next.hz)));
     next.writeHz = Math.min(next.hzMax, Math.max(next.hzMin, Number(next.writeHz)));
     ratePrefs[id] = next;
@@ -419,6 +422,15 @@
     return kind === "gripper";
   }
 
+  /** Offline max-read probe (button); arm deferred; gripper uses init flow instead. */
+  function isOfflineReadProbeKind(kind) {
+    return kind === "ft" || kind === "tactile" || kind === "realsense" || kind === "gello";
+  }
+
+  function supportsReadCap(kind) {
+    return isGripperKind(kind) || isOfflineReadProbeKind(kind);
+  }
+
   function formatGripperVal(v) {
     if (v == null || !Number.isFinite(Number(v))) return "—";
     return Number(v).toFixed(3);
@@ -466,8 +478,9 @@
       }
     }
     const isGripper = isGripperKind(currentDevice.kind);
+    const useCap = supportsReadCap(currentDevice.kind);
     const readMax =
-      isGripper && prefs.readCapHz != null ? Math.min(prefs.hzMax, prefs.readCapHz) : prefs.hzMax;
+      useCap && prefs.readCapHz != null ? Math.min(prefs.hzMax, prefs.readCapHz) : prefs.hzMax;
     rateEl.min = String(prefs.hzMin);
     rateEl.max = String(readMax);
     rateEl.step = readMax >= 100 ? "1" : "0.1";
@@ -483,14 +496,14 @@
       writeRateEl.value = String(prefs.writeHz);
     }
     if (rateBoundsHint) {
-      if (isGripper) {
+      if (useCap) {
         rateBoundsHint.textContent =
           prefs.readCapHz != null
             ? `${t("field.readCap", { hz: formatMeasured(prefs.readCapHz) })} · ${t("field.rateBounds", {
                 min: prefs.hzMin,
                 max: prefs.hzMax,
               })}`
-            : t("field.readCapWarm");
+            : t("field.readCapWarmGeneric");
       } else {
         rateBoundsHint.textContent = t("field.rateBounds", {
           min: prefs.hzMin,
@@ -504,6 +517,7 @@
     const isGripper = isGripperKind(currentDevice?.kind);
     if (gripperIoPanel) gripperIoPanel.hidden = !isGripper;
     if (gripperInitRow) gripperInitRow.hidden = !isGripper || !control().writable;
+    if (readProbeRow) readProbeRow.hidden = !isOfflineReadProbeKind(currentDevice?.kind);
     if (isGripper) {
       const live = batchSessions.find((s) => s.id === currentDevice.id);
       if (live) {
@@ -1862,6 +1876,62 @@
     }
   }
 
+  async function runOfflineReadProbe() {
+    if (!currentDevice?.id || !isOfflineReadProbeKind(currentDevice.kind)) return;
+    const btn = btnReadProbe;
+    const prevText = btn?.textContent;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = t("control.readProbeBusy");
+    }
+    await stopStream({ quiet: true });
+    const busy = t("control.readProbeBusy");
+    if (readProbeHint) readProbeHint.textContent = busy;
+    if (formHint) formHint.textContent = busy;
+    const duration_s = currentDevice.kind === "realsense" ? 3.0 : 10.0;
+    try {
+      const res = await fetch(`/api/probe/${encodeURIComponent(currentDevice.id)}/read-rate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          config: collectFormConfig(),
+          dry_run: dryRunEl.checked,
+          duration_s,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      const probe = data.read_probe || {};
+      if (probe.ok === false) throw new Error(probe.error || t("control.readProbeFailed"));
+      const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
+      const rawCap = Number(probe.read_cap_hz);
+      let hzMax = prefs.hzMax;
+      if (Number.isFinite(rawCap) && rawCap > hzMax) hzMax = Math.ceil(rawCap);
+      const cap = Math.max(
+        prefs.hzMin,
+        Math.min(hzMax, Number.isFinite(rawCap) ? rawCap : prefs.hzMin)
+      );
+      setRatePrefs(currentDevice.id, currentDevice.kind, {
+        hzMax,
+        readCapHz: cap,
+        hz: Math.min(cap, prefs.hz),
+      });
+      applyModalRateBounds();
+      const msg = t("control.readProbeDone", { hz: formatMeasured(cap) });
+      if (readProbeHint) readProbeHint.textContent = msg;
+      if (formHint) formHint.textContent = msg;
+    } catch (err) {
+      const msg = String(err.message || err);
+      if (readProbeHint) readProbeHint.textContent = msg;
+      if (formHint) formHint.textContent = msg;
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = prevText || t("btn.readProbe");
+      }
+    }
+  }
+
   function renderCards(devices) {
     lastDevices = devices || [];
     for (const d of lastDevices) deviceCache[d.id] = d;
@@ -2915,6 +2985,12 @@
   if (btnWriteProbe) {
     btnWriteProbe.addEventListener("click", () => {
       void runGripperWriteProbe();
+    });
+  }
+
+  if (btnReadProbe) {
+    btnReadProbe.addEventListener("click", () => {
+      void runOfflineReadProbe();
     });
   }
 

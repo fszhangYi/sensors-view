@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .read_rate_probe import _measure_rate_from_times, probe_read_hz  # noqa: F401
+
 
 def _ensure_sensors_path() -> Path:
     root = Path(__file__).resolve().parents[1]
@@ -28,15 +30,6 @@ def _ensure_sensors_path() -> Path:
     return root
 
 
-def _measure_rate_from_times(times: list[float]) -> float | None:
-    if len(times) < 3:
-        return None
-    span = times[-1] - times[0]
-    if span <= 0:
-        return None
-    return (len(times) - 1) / span
-
-
 def _open_gripper(sensor_id: str, config: dict[str, Any], dry_run: bool) -> Any:
     _ensure_sensors_path()
     from sensors.core.base import SensorContext
@@ -45,39 +38,6 @@ def _open_gripper(sensor_id: str, config: dict[str, Any], dry_run: bool) -> Any:
     sensor = DhAg95Sensor(sensor_id, config, SensorContext(dry_run=bool(dry_run)))
     sensor.open()
     return sensor
-
-
-def probe_read_hz(sensor: Any, *, duration_s: float = 10.0) -> dict[str, Any]:
-    duration_s = max(0.5, float(duration_s))
-    times: list[float] = []
-    errors = 0
-    deadline = time.perf_counter() + duration_s
-    while time.perf_counter() < deadline:
-        try:
-            sensor.read()
-            times.append(time.perf_counter())
-        except Exception:  # noqa: BLE001
-            errors += 1
-            if errors >= 5 and len(times) < 3:
-                break
-    measured = _measure_rate_from_times(times)
-    if measured is None:
-        return {
-            "ok": False,
-            "error": "read-rate probe failed (too few samples)",
-            "samples": len(times),
-            "errors": errors,
-            "duration_s": round(duration_s, 3),
-        }
-    cap = max(0.2, math.floor(measured * 0.95 * 10) / 10)
-    return {
-        "ok": True,
-        "samples": len(times),
-        "errors": errors,
-        "duration_s": round(duration_s, 3),
-        "measured_hz": round(measured, 3),
-        "read_cap_hz": cap,
-    }
 
 
 def probe_write_hz(

@@ -1228,6 +1228,16 @@ main {
   flex: 0 0 auto;
   min-width: 9.5rem;
 }
+.read-probe-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 0.35rem 0 0.75rem;
+}
+.read-probe-row .form-hint {
+  flex: 1 1 12rem;
+}
 .fixed-cmd-row {
   display: flex;
   flex-wrap: wrap;
