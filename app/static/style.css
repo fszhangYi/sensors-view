@@ -471,6 +471,15 @@ main {
   box-shadow: var(--shadow);
   backdrop-filter: blur(10px);
 }
+.post-bar {
+  margin: 0 0 0.75rem;
+  padding: 0.65rem 0.75rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+}
 .batch-controls {
   display: flex;
   flex-wrap: wrap;

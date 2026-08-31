@@ -38,6 +38,10 @@
   const batchSeqWrap = document.getElementById("batch-seq-wrap");
   const batchHint = document.getElementById("batch-hint");
   const exportDirEl = document.getElementById("export-dir");
+  const postInDirEl = document.getElementById("post-in-dir");
+  const postOutDirEl = document.getElementById("post-out-dir");
+  const postSeqEl = document.getElementById("post-seq");
+  const postHint = document.getElementById("post-hint");
   const liveModal = document.getElementById("live-modal");
   const liveStage = document.getElementById("live-stage");
   const liveStatusList = document.getElementById("live-status-list");
@@ -45,7 +49,6 @@
   const btnLiveStop = document.getElementById("btn-live-stop");
   const btnLiveClose = document.getElementById("btn-live-close");
   const btnLiveSave = document.getElementById("btn-live-save");
-  const btnLivePost = document.getElementById("btn-live-post");
   const liveSeqEl = document.getElementById("live-seq");
   const liveSeqWrap = document.getElementById("live-seq-wrap");
   const rateBoundsHint = document.getElementById("rate-bounds-hint");
@@ -64,6 +67,7 @@
   const commandHint = document.getElementById("command-hint");
 
   const RATE_PREFS_KEY = "sensors-view.ratePrefs";
+  const BATCH_SEQ_KEY = "sensors-view.batchSeq";
   /** @type {Record<string, { min: number, max: number, defaultHz: number }>} */
   const KIND_RATE_DEFAULTS = {
     realsense: { min: 5, max: 30, defaultHz: 15 },
@@ -440,6 +444,60 @@
     });
   }
 
+  function parseBatchSeq(raw) {
+    const text = String(raw ?? "").trim();
+    if (!text || !/^\d+$/.test(text)) return null;
+    const n = Number.parseInt(text, 10);
+    return Number.isInteger(n) && n >= 1 ? n : null;
+  }
+
+  function readStoredBatchSeq() {
+    try {
+      return parseBatchSeq(localStorage.getItem(BATCH_SEQ_KEY));
+    } catch {
+      return null;
+    }
+  }
+
+  function setBatchSeqValue(n, { persist = true } = {}) {
+    if (!Number.isInteger(n) || n < 1) return;
+    const text = String(n);
+    if (batchSeqEl) batchSeqEl.value = text;
+    if (liveSeqEl) liveSeqEl.value = text;
+    if (persist) {
+      try {
+        localStorage.setItem(BATCH_SEQ_KEY, text);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  function syncBatchSeqFrom(el) {
+    if (!el) return;
+    const n = parseBatchSeq(el.value);
+    if (n == null) return;
+    setBatchSeqValue(n);
+  }
+
+  function ensureBatchSeqInitialized() {
+    const current =
+      parseBatchSeq(batchSeqEl?.value) ??
+      parseBatchSeq(liveSeqEl?.value) ??
+      readStoredBatchSeq() ??
+      1;
+    setBatchSeqValue(current);
+  }
+
+  function bumpBatchSeq() {
+    const current =
+      parseBatchSeq(batchSeqEl?.value) ??
+      parseBatchSeq(liveSeqEl?.value) ??
+      readStoredBatchSeq() ??
+      1;
+    setBatchSeqValue(current + 1);
+  }
+
   function setBatchUi() {
     if (!btnBatchStart) return;
     btnBatchStart.disabled = batchRunning;
@@ -453,29 +511,23 @@
       el.disabled = batchRunning;
     });
     const showSave = batchCanSave && !batchRunning && batchSampleTotal() > 0;
-    const dirReady = !!String(exportDirEl?.value || "").trim();
-    const showPost = !batchRunning && dirReady;
-    if (batchSeqWrap) batchSeqWrap.hidden = !(showSave || showPost);
+    if (batchSeqWrap) batchSeqWrap.hidden = false;
     if (btnBatchSave) {
       btnBatchSave.hidden = !showSave;
       btnBatchSave.disabled = !showSave;
     }
-    if (btnBatchPost) {
-      btnBatchPost.hidden = !showPost;
-      btnBatchPost.disabled = !showPost;
-    }
     if (btnLiveStop) btnLiveStop.disabled = !batchRunning;
-    if (liveSeqWrap) liveSeqWrap.hidden = !(showSave || showPost);
+    if (liveSeqWrap) liveSeqWrap.hidden = !showSave;
     if (btnLiveSave) {
       btnLiveSave.hidden = !showSave;
       btnLiveSave.disabled = !showSave;
     }
-    if (btnLivePost) {
-      btnLivePost.hidden = !showPost;
-      btnLivePost.disabled = !showPost;
-    }
-    if ((showSave || showPost) && liveSeqEl && batchSeqEl && !liveSeqEl.value) {
-      liveSeqEl.value = batchSeqEl.value || "";
+    if (showSave) {
+      const n =
+        parseBatchSeq(batchSeqEl?.value) ??
+        parseBatchSeq(liveSeqEl?.value) ??
+        readStoredBatchSeq();
+      if (n != null) setBatchSeqValue(n, { persist: false });
     }
   }
 
@@ -1111,22 +1163,21 @@
       if (liveHint) liveHint.textContent = msg;
       return;
     }
-    if (liveSeqEl?.value && batchSeqEl && !String(batchSeqEl.value || "").trim()) {
-      batchSeqEl.value = liveSeqEl.value;
-    }
-    if (batchSeqEl?.value && liveSeqEl && !String(liveSeqEl.value || "").trim()) {
-      liveSeqEl.value = batchSeqEl.value;
-    }
-    const seq = String(liveSeqEl?.value || batchSeqEl?.value || "").trim();
-    if (!seq) {
-      const msg = t("batch.needSeq");
+    syncBatchSeqFrom(liveSeqEl?.value ? liveSeqEl : batchSeqEl);
+    const seqNum =
+      parseBatchSeq(liveSeqEl?.value) ??
+      parseBatchSeq(batchSeqEl?.value) ??
+      null;
+    if (seqNum == null) {
+      const raw = String(liveSeqEl?.value || batchSeqEl?.value || "").trim();
+      const msg = raw ? t("batch.needSeqInt") : t("batch.needSeq");
       if (batchHint) batchHint.textContent = msg;
       if (liveHint) liveHint.textContent = msg;
       (liveSeqEl || batchSeqEl)?.focus();
       return;
     }
-    if (batchSeqEl) batchSeqEl.value = seq;
-    if (liveSeqEl) liveSeqEl.value = seq;
+    setBatchSeqValue(seqNum);
+    const seq = String(seqNum);
     const dir = String(exportDirEl?.value || "").trim();
     if (!dir) {
       const msg = t("batch.needDir");
@@ -1135,8 +1186,7 @@
       exportDirEl?.focus();
       return;
     }
-    const safeSeq = seq.replace(/[^\w.\-]+/g, "_");
-    const file = `sensors-view-${safeSeq}.json`;
+    const file = `sensors-view-${seq}.json`;
     const deviceIds = Object.keys(batchStreams);
     const payload = {
       seq,
@@ -1168,6 +1218,7 @@
     if (btnLiveSave) btnLiveSave.disabled = true;
     saveJsonToServer(file, payload, dir)
       .then((res) => {
+        bumpBatchSeq();
         const msg = t("batch.saved", { count, path: res.path || file });
         if (batchHint) batchHint.textContent = msg;
         if (liveHint) liveHint.textContent = msg;
@@ -1224,32 +1275,47 @@
     throw new Error("postprocess timeout");
   }
 
+  function defaultPostOutDir(inDir) {
+    const base = String(inDir || "").trim().replace(/[\\/]+$/, "");
+    if (!base) return "";
+    return `${base}/aligned`;
+  }
+
+  function syncPostPathsFromExport(force) {
+    const exportDir = String(exportDirEl?.value || "").trim();
+    if (!exportDir) return;
+    if (postInDirEl && (force || !String(postInDirEl.value || "").trim())) {
+      postInDirEl.value = exportDir;
+    }
+    if (postOutDirEl && (force || !String(postOutDirEl.value || "").trim())) {
+      postOutDirEl.value = defaultPostOutDir(postInDirEl?.value || exportDir);
+    }
+  }
+
   function runBatchPostprocess() {
-    if (liveSeqEl?.value && batchSeqEl && !String(batchSeqEl.value || "").trim()) {
-      batchSeqEl.value = liveSeqEl.value;
-    }
-    if (batchSeqEl?.value && liveSeqEl && !String(liveSeqEl.value || "").trim()) {
-      liveSeqEl.value = batchSeqEl.value;
-    }
-    const dir = String(exportDirEl?.value || "").trim();
-    if (!dir) {
-      const msg = t("batch.needDir");
-      if (batchHint) batchHint.textContent = msg;
-      if (liveHint) liveHint.textContent = msg;
-      exportDirEl?.focus();
+    const inDir = String(postInDirEl?.value || "").trim();
+    if (!inDir) {
+      const msg = t("post.needIn");
+      if (postHint) postHint.textContent = msg;
+      postInDirEl?.focus();
       return;
     }
-    const seq = String(liveSeqEl?.value || batchSeqEl?.value || "").trim();
-    const starting = t("batch.posting");
-    if (batchHint) batchHint.textContent = starting;
-    if (liveHint) liveHint.textContent = starting;
+    const outDir = String(postOutDirEl?.value || "").trim();
+    if (!outDir) {
+      const msg = t("post.needOut");
+      if (postHint) postHint.textContent = msg;
+      postOutDirEl?.focus();
+      return;
+    }
+    const seq = String(postSeqEl?.value || "").trim();
+    if (postHint) postHint.textContent = t("batch.posting");
     if (btnBatchPost) btnBatchPost.disabled = true;
-    if (btnLivePost) btnLivePost.disabled = true;
     fetch("/api/postprocess", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        dir,
+        dir: inDir,
+        out_dir: outDir,
         seq: seq || undefined,
         interval_ms: 200,
         write_video: false,
@@ -1264,21 +1330,19 @@
       .then((res) => {
         const results = res.results || [];
         const first = results[0] || {};
-        const msg = t("batch.posted", {
-          n: results.length || 1,
-          frames: first.frames ?? "—",
-          path: first.path || res.out_dir || res.path || dir,
-        });
-        if (batchHint) batchHint.textContent = msg;
-        if (liveHint) liveHint.textContent = msg;
+        if (postHint) {
+          postHint.textContent = t("batch.posted", {
+            n: results.length || 1,
+            frames: first.frames ?? "—",
+            path: first.path || res.out_dir || res.path || outDir,
+          });
+        }
       })
       .catch((err) => {
-        const msg = t("batch.postFailed", { err: err.message || err });
-        if (batchHint) batchHint.textContent = msg;
-        if (liveHint) liveHint.textContent = msg;
+        if (postHint) postHint.textContent = t("batch.postFailed", { err: err.message || err });
       })
       .finally(() => {
-        setBatchUi();
+        if (btnBatchPost) btnBatchPost.disabled = false;
       });
   }
 
@@ -1294,6 +1358,7 @@
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(apiDetail(body) || `HTTP ${res.status}`);
     if (body.dir) exportDirEl.value = body.dir;
+    syncPostPathsFromExport(false);
   }
 
   function bindCardRateControls(card, d) {
@@ -2125,6 +2190,13 @@
     if (exportDirEl && meta.export_dir) {
       exportDirEl.value = meta.export_dir;
       exportDirEl.placeholder = meta.export_dir_default || meta.export_dir;
+      syncPostPathsFromExport(false);
+      if (postInDirEl) {
+        postInDirEl.placeholder = meta.export_dir_default || meta.export_dir;
+      }
+      if (postOutDirEl) {
+        postOutDirEl.placeholder = defaultPostOutDir(meta.export_dir_default || meta.export_dir);
+      }
     }
     setText("meta-config", meta.sensors_config || "—");
     return meta;
@@ -2202,13 +2274,27 @@
   });
   btnBatchSave?.addEventListener("click", saveBatchFile);
   btnBatchPost?.addEventListener("click", runBatchPostprocess);
+  const onSeqInput = (e) => syncBatchSeqFrom(e.target);
+  const onSeqBlur = (e) => {
+    const n = parseBatchSeq(e.target.value);
+    if (n != null) {
+      setBatchSeqValue(n);
+      return;
+    }
+    ensureBatchSeqInitialized();
+  };
+  batchSeqEl?.addEventListener("input", onSeqInput);
+  liveSeqEl?.addEventListener("input", onSeqInput);
+  batchSeqEl?.addEventListener("change", onSeqInput);
+  liveSeqEl?.addEventListener("change", onSeqInput);
+  batchSeqEl?.addEventListener("blur", onSeqBlur);
+  liveSeqEl?.addEventListener("blur", onSeqBlur);
   btnLiveStop?.addEventListener("click", () => {
     stopBatch().catch((err) => {
       if (liveHint) liveHint.textContent = String(err.message || err);
     });
   });
   btnLiveSave?.addEventListener("click", saveBatchFile);
-  btnLivePost?.addEventListener("click", runBatchPostprocess);
   btnLiveClose?.addEventListener("click", () => {
     dismissLiveDashboard().catch((err) => {
       if (liveHint) liveHint.textContent = String(err.message || err);
@@ -2218,6 +2304,13 @@
     persistExportDir().catch((err) => {
       if (batchHint) batchHint.textContent = t("batch.saveFailed", { err: err.message || err });
     });
+  });
+  postInDirEl?.addEventListener("change", () => {
+    const inDir = String(postInDirEl.value || "").trim();
+    if (!inDir) return;
+    if (postOutDirEl && !String(postOutDirEl.value || "").trim()) {
+      postOutDirEl.value = defaultPostOutDir(inDir);
+    }
   });
   btnLogout?.addEventListener("click", logout);
   btnUsers?.addEventListener("click", () => {
@@ -2369,6 +2462,8 @@
   });
 
   (async () => {
+    ensureBatchSeqInitialized();
+    setBatchUi();
     if (await requireAuth()) probe();
   })();
 })();
