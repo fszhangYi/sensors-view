@@ -9,7 +9,16 @@
     /* Boot: theme + locale before paint */
     (function () {
       try {
+        var framed = false;
+        try { framed = window.self !== window.top; } catch (e0) { framed = true; }
+        var q = {};
+        try {
+          var sp = new URLSearchParams(location.search);
+          q.locale = (sp.get("locale") || sp.get("lang") || "").toLowerCase();
+          q.theme = (sp.get("theme") || "").toLowerCase();
+        } catch (e1) { /* ignore */ }
         var t = localStorage.getItem("sensors-view.theme") || "dark";
+        if (framed && (q.theme === "dark" || q.theme === "light" || q.theme === "system")) t = q.theme;
         var resolved = t === "light" || t === "dark"
           ? t
           : (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
@@ -20,6 +29,7 @@
         var meta = document.querySelector('meta[name="color-scheme"]');
         if (meta) meta.setAttribute("content", resolved);
         var loc = localStorage.getItem("sensors-view.locale") || "zh";
+        if (framed && (q.locale === "zh" || q.locale === "en")) loc = q.locale;
         if (loc !== "zh" && loc !== "en") loc = "zh";
         root.lang = loc === "zh" ? "zh-CN" : "en";
       } catch (e) { /* ignore */ }
@@ -55,9 +65,9 @@
       color: #8b9bb4;
     }
   </style>
-  <link rel="stylesheet" href="/static/fonts.css?v=64" />
+  <link rel="stylesheet" href="/static/fonts.css?v=68" />
   <link rel="icon" href="/static/assets/favicon.svg" type="image/svg+xml" />
-  <link rel="stylesheet" href="/static/style.css?v=64" />
+  <link rel="stylesheet" href="/static/style.css?v=68" />
 </head>
 <body class="sensors-view-page page-booting" data-i18n-title="meta.title">
   <div id="page-boot" class="page-boot" role="status" aria-live="polite">
@@ -72,6 +82,10 @@
       <p class="lede" data-i18n="home.lede">点击卡片配置连接，按设定频率连续采样并在弹窗内可视化。</p>
     </div>
     <div class="controls">
+      <div id="iframe-embed-badge" class="iframe-embed-badge" hidden role="status" aria-live="polite" data-i18n="embed.iframe" data-i18n-attr="title" title="当前页面被 iframe 嵌入">
+        <span class="iframe-embed-dot" aria-hidden="true"></span>
+        <span class="iframe-embed-label" aria-hidden="true">iframe</span>
+      </div>
       <div class="theme-seg" id="locale-seg" role="group" data-i18n="locale.aria" data-i18n-attr="aria-label" aria-label="界面语言">
         <button type="button" data-locale="zh" aria-pressed="true" class="active" data-i18n="locale.zh">中文</button>
         <button type="button" data-locale="en" aria-pressed="false" data-i18n="locale.en">English</button>
@@ -358,8 +372,9 @@
       dryRun: {{ dry_run | tojson }},
     };
   </script>
-  <script src="/static/i18n.js?v=64"></script>
-  <script src="/static/appearance.js?v=64"></script>
-  <script src="/static/app.js?v=64"></script>
+  <script src="/static/i18n.js?v=68"></script>
+  <script src="/static/appearance.js?v=68"></script>
+  <script src="/static/embed.js?v=68"></script>
+  <script src="/static/app.js?v=68"></script>
 </body>
 </html>

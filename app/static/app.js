@@ -13,6 +13,30 @@
   const passwordForm = document.getElementById("password-form");
   const passwordHint = document.getElementById("password-hint");
   const userCreateForm = document.getElementById("user-create-form");
+  const iframeEmbedBadge = document.getElementById("iframe-embed-badge");
+
+  function isFramedEmbed() {
+    return !!window.SensorsEmbed?.isFramed?.() || (() => {
+      try {
+        return window.self !== window.top;
+      } catch {
+        return true;
+      }
+    })();
+  }
+
+  function syncIframeEmbedBadge() {
+    if (window.SensorsEmbed?.syncIframeBadge) {
+      window.SensorsEmbed.syncIframeBadge(isFramedEmbed());
+      window.SensorsEmbed.setChromeHidden?.(isFramedEmbed());
+      return;
+    }
+    if (!iframeEmbedBadge) return;
+    const framed = isFramedEmbed();
+    iframeEmbedBadge.hidden = !framed;
+    iframeEmbedBadge.setAttribute("aria-hidden", framed ? "false" : "true");
+  }
+  syncIframeEmbedBadge();
 
   let currentAuthUser = null;
 
@@ -88,10 +112,10 @@
   const KIND_RATE_DEFAULTS = {
     realsense: { min: 5, max: 30, defaultHz: 15 },
     arm: { min: 100, max: 1000, defaultHz: 100 },
-    gello: { min: 100, max: 1000, defaultHz: 100 },
+    gello: { min: 1, max: 1000, defaultHz: 100 },
     gripper: { min: 1, max: 200, defaultHz: 8 },
     tactile: { min: 1, max: 50, defaultHz: 10 },
-    ft: { min: 100, max: 2000, defaultHz: 200 },
+    ft: { min: 1, max: 2000, defaultHz: 200 },
     bus: { min: 1, max: 50, defaultHz: 10 },
     pipeline: { min: 1, max: 50, defaultHz: 10 },
   };
@@ -198,8 +222,10 @@
       }
       finishPageBoot();
       currentAuthUser = me.user || null;
-      if (btnLogout) btnLogout.hidden = !me.authRequired;
-      if (btnUsers) btnUsers.hidden = !me.authRequired;
+      const framed = isFramedEmbed();
+      if (btnLogout) btnLogout.hidden = framed || !me.authRequired;
+      if (btnUsers) btnUsers.hidden = framed || !me.authRequired;
+      if (framed) window.SensorsEmbed?.setChromeHidden?.(true);
       return true;
     } catch {
       finishPageBoot();
@@ -339,6 +365,8 @@
     if (!Number.isFinite(hzMax)) hzMax = def.max;
     // Migrate old gripper ceiling (40) so probed 100+ Hz read caps can apply.
     if (isGripperKind(kind) && hzMax <= 40 && def.max > 40) hzMax = def.max;
+    // Migrate old gello/ft floor (100) that inflated low probe results to a fake 100 Hz.
+    if ((kind === "gello" || kind === "ft") && hzMin >= 100 && def.min < 100) hzMin = def.min;
     if (hzMax < hzMin) {
       const tmp = hzMin;
       hzMin = hzMax;
@@ -1791,6 +1819,42 @@
     return { started: true, data };
   }
 
+  function applyReadProbeResult(probe, data) {
+    const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
+    const measured = Number(probe.measured_hz);
+    const rawCap = Number(probe.read_cap_hz);
+    if (!Number.isFinite(rawCap) || rawCap <= 0) {
+      throw new Error(probe.error || t("control.readProbeFailed"));
+    }
+    let hzMax = prefs.hzMax;
+    let hzMin = prefs.hzMin;
+    // Never inflate the probed cap up to hzMin (that previously forced gello/ft → 100).
+    if (rawCap > hzMax) hzMax = Math.ceil(rawCap);
+    if (rawCap < hzMin) hzMin = Math.max(0.2, Math.floor(rawCap * 10) / 10);
+    const cap = Math.min(hzMax, Math.max(0.2, rawCap));
+    setRatePrefs(currentDevice.id, currentDevice.kind, {
+      hzMin,
+      hzMax,
+      readCapHz: cap,
+      // Adopt the probed cap as the working read rate so the UI shows the measurement.
+      hz: cap,
+    });
+    applyModalRateBounds();
+    const dry = data?.dry_run ?? probe.dry_run;
+    const samples = probe.samples ?? "—";
+    const dur = probe.duration_s ?? "—";
+    const method = probe.method || "tight_read_loop";
+    const measTxt = Number.isFinite(measured) ? formatMeasured(measured) : "—";
+    return t("control.readProbeDoneDetail", {
+      measured: measTxt,
+      cap: formatMeasured(cap),
+      samples,
+      dur,
+      method,
+      dry: dry ? "dry-run" : "live",
+    });
+  }
+
   async function calibrateGripper() {
     if (!currentDevice?.id || currentDevice.kind !== "gripper") return;
     const btn = btnGripperInit;
@@ -1836,26 +1900,12 @@
       const readData = await readRes.json().catch(() => ({}));
       if (!readRes.ok) throw new Error(readData.detail || `HTTP ${readRes.status}`);
       const probe = readData.read_probe || {};
-
-      const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
-      const rawCap = Number(probe.read_cap_hz);
-      let hzMax = prefs.hzMax;
-      if (Number.isFinite(rawCap) && rawCap > hzMax) hzMax = Math.ceil(rawCap);
-      const cap = Math.max(
-        prefs.hzMin,
-        Math.min(hzMax, Number.isFinite(rawCap) ? rawCap : prefs.hzMin)
-      );
-      setRatePrefs(currentDevice.id, currentDevice.kind, {
-        hzMax,
-        readCapHz: cap,
-        hz: Math.min(cap, prefs.hz),
-      });
-      applyModalRateBounds();
+      if (probe.ok === false) throw new Error(probe.error || t("control.readProbeFailed"));
+      const doneRead = applyReadProbeResult(probe, readData);
       const doneInit = t("control.gripperInitDone", {
         min: cr.position_raw_min ?? "—",
         max: cr.position_raw_max ?? "—",
       });
-      const doneRead = t("control.readProbeDone", { hz: formatMeasured(cap) });
       const msg = `${doneInit} · ${doneRead}`;
       gripperInitHint.textContent = msg;
       if (formHint) formHint.textContent = msg;
@@ -1888,7 +1938,8 @@
     const busy = t("control.readProbeBusy");
     if (readProbeHint) readProbeHint.textContent = busy;
     if (formHint) formHint.textContent = busy;
-    const duration_s = currentDevice.kind === "realsense" ? 3.0 : 10.0;
+    const duration_s =
+      currentDevice.kind === "realsense" ? 3.0 : currentDevice.kind === "ft" || currentDevice.kind === "gello" ? 5.0 : 10.0;
     try {
       const res = await fetch(`/api/probe/${encodeURIComponent(currentDevice.id)}/read-rate`, {
         method: "POST",
@@ -1903,21 +1954,7 @@
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       const probe = data.read_probe || {};
       if (probe.ok === false) throw new Error(probe.error || t("control.readProbeFailed"));
-      const prefs = getRatePrefs(currentDevice.id, currentDevice.kind);
-      const rawCap = Number(probe.read_cap_hz);
-      let hzMax = prefs.hzMax;
-      if (Number.isFinite(rawCap) && rawCap > hzMax) hzMax = Math.ceil(rawCap);
-      const cap = Math.max(
-        prefs.hzMin,
-        Math.min(hzMax, Number.isFinite(rawCap) ? rawCap : prefs.hzMin)
-      );
-      setRatePrefs(currentDevice.id, currentDevice.kind, {
-        hzMax,
-        readCapHz: cap,
-        hz: Math.min(cap, prefs.hz),
-      });
-      applyModalRateBounds();
-      const msg = t("control.readProbeDone", { hz: formatMeasured(cap) });
+      const msg = applyReadProbeResult(probe, data);
       if (readProbeHint) readProbeHint.textContent = msg;
       if (formHint) formHint.textContent = msg;
     } catch (err) {
@@ -2795,7 +2832,7 @@
       currentDevice.config = mergeDeviceConfig(data.config, id);
       modalTitle.textContent = data.name || data.id;
       modalKind.textContent = `${data.kind} · ${data.id}`;
-      dryRunEl.checked = !!data.dry_run_default;
+      dryRunEl.checked = false;
       applyModalRateBounds();
       syncGripperIoPanelVisibility();
 
@@ -2885,7 +2922,7 @@
     setText("meta-site", meta.site || "—");
     setText("meta-count", String(meta.count ?? "—"));
     setText("meta-mode", meta.dry_run ? "dry-run" : "live");
-    if (batchDryRunEl && !batchRunning) batchDryRunEl.checked = !!meta.dry_run;
+    // dry-run is opt-in; never re-check from server default on meta refresh / probe
     if (exportDirEl && meta.export_dir) {
       exportDirEl.value = meta.export_dir;
       exportDirEl.placeholder = meta.export_dir_default || meta.export_dir;

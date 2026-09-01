@@ -1,4 +1,5 @@
 # sensors-view runtime — points at linked hik-sensors bundle
 sensors_config: sensors/configs/default.yaml
-dry_run: true
+# dry-run is opt-in via UI checkboxes; do not default to simulated hardware
+dry_run: false
 title: sensors-view

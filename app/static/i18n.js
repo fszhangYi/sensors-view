@@ -19,7 +19,9 @@
       "locale.aria": "界面语言",
       "locale.zh": "中文",
       "locale.en": "English",
+      "embed.iframe": "当前页面被 iframe 嵌入",
       "btn.probe": "探测状态",
+      "btn.probeHint": "对每个传感器做真机连接检查（非 dry-run 的 open+read；成功=ok，失败=offline，连通但有其它异常=warn）",
       "btn.reload": "重载配置",
       "btn.close": "关闭",
       "btn.start": "开始连续采样",
@@ -36,7 +38,7 @@
       "field.postInDir": "输入路径",
       "field.postOutDir": "输出路径",
       "card.select": "选择",
-      "batch.lede": "各卡片单独设定目标频率与上下限；采集中按实测 Hz 更新 status",
+      "batch.lede": "各卡片单独设定目标频率与上下限；顶部「探测状态」按真机连接标 ok / offline / warn",
       "batch.none": "请先勾选至少一个传感器",
       "batch.checking": "逐个检查在线状态…",
       "batch.offline": "{id} 未在线（{status}）",
@@ -96,6 +98,7 @@
       "control.gripperInitFailed": "初始化失败",
       "control.readProbeBusy": "读速脚本运行中（独立进程 · 最大读频）…",
       "control.readProbeDone": "最大读取频率约 {hz} Hz（已设为读取上限）",
+      "control.readProbeDoneDetail": "实测 {measured} Hz → 上限 {cap} Hz（n={samples} · {dur}s · {method} · {dry}）",
       "control.readProbeFailed": "读取频率自测失败",
       "btn.writeProbe": "测量最大写入频率",
       "btn.writeProbeStop": "停止写入测频",
@@ -226,7 +229,9 @@
       "locale.aria": "Language",
       "locale.zh": "中文",
       "locale.en": "English",
+      "embed.iframe": "This page is embedded in an iframe",
       "btn.probe": "Probe",
+      "btn.probeHint": "Live connection check per device (non-dry-run open+read; ok / offline / warn)",
       "btn.reload": "Reload config",
       "btn.close": "Close",
       "btn.start": "Start stream",
@@ -243,7 +248,7 @@
       "field.postInDir": "Input path",
       "field.postOutDir": "Output path",
       "card.select": "Select",
-      "batch.lede": "Set target Hz and limits per card; status reflects measured rate while streaming",
+      "batch.lede": "Set target Hz and limits per card; Probe marks ok / offline / warn from live connect",
       "batch.none": "Select at least one sensor",
       "batch.checking": "Checking online status…",
       "batch.offline": "{id} offline ({status})",
@@ -297,6 +302,7 @@
       "control.gripperInitFailed": "Initialization failed",
       "control.readProbeBusy": "Read-rate script running (dedicated process · max read)…",
       "control.readProbeDone": "Max read rate ≈ {hz} Hz (set as read cap)",
+      "control.readProbeDoneDetail": "Measured {measured} Hz → cap {cap} Hz (n={samples} · {dur}s · {method} · {dry})",
       "control.readProbeFailed": "Read-rate probe failed",
       "btn.writeProbe": "Measure max write rate",
       "btn.writeProbeStop": "Stop write probe",
@@ -480,16 +486,19 @@
     });
   }
 
-  function setLocale(next) {
+  function setLocale(next, opts) {
     if (!isLocale(next) || next === locale) {
       syncLocaleSeg();
       return;
     }
     locale = next;
-    try {
-      localStorage.setItem(LOCALE_KEY, locale);
-    } catch {
-      /* ignore */
+    const persist = !opts || opts.persist !== false;
+    if (persist) {
+      try {
+        localStorage.setItem(LOCALE_KEY, locale);
+      } catch {
+        /* ignore */
+      }
     }
     document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
     applyDomI18n(document);

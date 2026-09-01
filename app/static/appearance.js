@@ -86,10 +86,11 @@
     if (prefs.theme === "system") applyAppearance(prefs);
   }
 
-  function setTheme(theme) {
+  function setTheme(theme, opts) {
     if (!isThemePref(theme)) return;
+    const persist = !opts || opts.persist !== false;
     prefs = { ...prefs, theme };
-    persistAppearance(prefs);
+    if (persist) persistAppearance(prefs);
     applyAppearance(prefs);
     bindSystemListener();
     syncThemeSeg();

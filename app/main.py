@@ -38,8 +38,14 @@ SENSORS_SRC = sensors_src_dir()
 if SENSORS_SRC.is_dir() and str(SENSORS_SRC) not in sys.path:
     sys.path.insert(0, str(SENSORS_SRC))
 
-from sensors.core.base import SensorContext  # noqa: E402
+from sensors.core.base import Sensor, SensorContext  # noqa: E402
+from sensors.core.health import CheckResult, HealthReport, HealthStatus  # noqa: E402
 from sensors.runtime.manager import SensorManager  # noqa: E402
+
+# Kinds where "探测状态" means a real non-dry-run open+read (same bar as 单次采样).
+# bus/pipeline: shallow probe only — open() may start socat / has no meaningful sample.
+_LIVE_CONNECT_KINDS = frozenset({"arm", "gripper", "gello", "ft", "tactile", "realsense"})
+_SHALLOW_CONNECT_KINDS = frozenset({"bus", "pipeline"})
 
 APP_DIR = app_package_dir()
 DEFAULT_VIEW_CFG = default_view_config() if default_view_config().is_file() else (ROOT / "configs" / "view.yaml")
@@ -277,7 +283,7 @@ def get_manager(*, reload: bool = False) -> SensorManager:
     cfg_path = _resolve_sensors_config(_view_cfg.get("sensors_config", "sensors/configs/default.yaml"))
     if not cfg_path.is_file():
         raise FileNotFoundError(f"sensors config not found: {cfg_path}")
-    dry_run = bool(_view_cfg.get("dry_run", True))
+    dry_run = bool(_view_cfg.get("dry_run", False))
     _mgr = SensorManager.from_yaml(cfg_path, dry_run=dry_run)
     return _mgr
 
@@ -1034,7 +1040,7 @@ def index(request: Request) -> HTMLResponse:
         "index.html",
         {
             "title": _view_cfg.get("title", "sensors-view"),
-            "dry_run": bool(_view_cfg.get("dry_run", True)),
+            "dry_run": bool(_view_cfg.get("dry_run", False)),
             "sensors_config": str(
                 _resolve_sensors_config(_view_cfg.get("sensors_config", "sensors/configs/default.yaml"))
             ),
@@ -1240,21 +1246,153 @@ def api_postprocess_job(job_id: str) -> dict[str, Any]:
 
 @app.get("/api/probe")
 def api_probe(id: str | None = Query(default=None)) -> dict[str, Any]:
+    """Per-device connection check for the overview cards.
+
+    Semantics (real hardware, never dry-run):
+      ok      — non-dry-run open+read succeeded (same bar as 单次采样)
+      offline — open/read failed (or shallow probe says unreachable)
+      warn    — connected, but other non-critical anomalies remain
+    """
     mgr = get_manager()
     only = [id] if id else None
-    reports = mgr.probe_all(only=only)
+    wanted = set(only) if only else None
+    bases = [s for s in mgr if wanted is None or s.id in wanted]
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    by_id: dict[str, HealthReport] = {}
+    workers = min(4, max(1, len(bases)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_connectivity_probe_device, b): b.id for b in bases}
+        for fut in as_completed(futs):
+            sid = futs[fut]
+            try:
+                by_id[sid] = fut.result()
+            except Exception as e:  # noqa: BLE001
+                by_id[sid] = HealthReport(
+                    sensor_id=sid,
+                    kind="unknown",
+                    status=HealthStatus.OFFLINE,
+                    message=str(e),
+                    checks=[CheckResult("connect", False, str(e), critical=True)],
+                )
+
     devices: list[dict[str, Any]] = []
-    for r in reports:
+    order = only if only else mgr.ids()
+    for sid in order:
+        r = by_id.get(sid)
+        if r is None:
+            continue
         d = r.to_dict()
         try:
-            sensor = mgr.get(r.sensor_id)
+            sensor = mgr.get(sid)
             d["name"] = sensor.name
             d["config"] = _public_config(sensor.config)
+            d["kind"] = sensor.kind.value
         except KeyError:
-            d["name"] = r.sensor_id
+            d["name"] = sid
             d["config"] = {}
         devices.append(d)
     return {"site": mgr.bundle.site, "dry_run": mgr.ctx.dry_run, "devices": devices}
+
+
+def _remap_shallow_status(status: HealthStatus) -> HealthStatus:
+    if status == HealthStatus.OK:
+        return HealthStatus.OK
+    if status == HealthStatus.WARN:
+        return HealthStatus.WARN
+    return HealthStatus.OFFLINE
+
+
+def _shallow_connectivity_probe(base: Sensor) -> HealthReport:
+    """bus/pipeline: use driver probe() with dry_run forced off; map error→offline."""
+    live = type(base)(base.id, dict(base.config), SensorContext(dry_run=False))
+    report = live.probe()
+    status = _remap_shallow_status(report.status)
+    return HealthReport(
+        sensor_id=report.sensor_id,
+        kind=report.kind,
+        status=status,
+        message=report.message,
+        checks=list(report.checks),
+        metrics=dict(report.metrics),
+        hints=list(report.hints),
+    )
+
+
+def _live_sample_connectivity_probe(base: Sensor) -> HealthReport:
+    """Try the same path as 单次采样: open + read with dry_run=False."""
+    sid = base.id
+    kind = base.kind.value
+    config = dict(base.config)
+    checks: list[CheckResult] = []
+    metrics: dict[str, Any] = {"method": "open_read"}
+    hints: list[str] = []
+
+    _close_sessions_for_sensor(sid)
+    sensor = type(base)(sid, config, SensorContext(dry_run=False))
+    try:
+        sensor.open()
+        sample = dict(sensor.read())
+        checks.append(CheckResult("connect", True, "open+read ok"))
+        metrics["sample_keys"] = [str(k) for k in list(sample.keys())[:16]]
+
+        # Soft anomalies after a successful sample → warn (not offline).
+        shallow = type(base)(sid, config, SensorContext(dry_run=False)).probe()
+        hints = list(shallow.hints or [])
+        soft = [c for c in shallow.checks if not c.ok]
+        for c in soft:
+            checks.append(
+                CheckResult(
+                    name=c.name,
+                    ok=False,
+                    detail=c.detail,
+                    critical=False,
+                )
+            )
+        if soft:
+            return HealthReport(
+                sensor_id=sid,
+                kind=kind,
+                status=HealthStatus.WARN,
+                message=shallow.message or "connected with warnings",
+                checks=checks,
+                metrics={**dict(shallow.metrics), **metrics},
+                hints=hints,
+            )
+        return HealthReport(
+            sensor_id=sid,
+            kind=kind,
+            status=HealthStatus.OK,
+            message="connected",
+            checks=checks,
+            metrics=metrics,
+            hints=hints,
+        )
+    except Exception as e:  # noqa: BLE001
+        err = str(e) or e.__class__.__name__
+        checks.append(CheckResult("connect", False, err, critical=True))
+        return HealthReport(
+            sensor_id=sid,
+            kind=kind,
+            status=HealthStatus.OFFLINE,
+            message=err,
+            checks=checks,
+            metrics=metrics,
+            hints=hints,
+        )
+    finally:
+        try:
+            sensor.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _connectivity_probe_device(base: Sensor) -> HealthReport:
+    kind = str(base.kind.value).lower()
+    if kind in _SHALLOW_CONNECT_KINDS or kind not in _LIVE_CONNECT_KINDS:
+        return _shallow_connectivity_probe(base)
+    return _live_sample_connectivity_probe(base)
 
 
 @app.get("/api/device/{sensor_id}")
@@ -1271,7 +1409,8 @@ def api_device(sensor_id: str) -> dict[str, Any]:
         "config": _public_config(sensor.config),
         "fields": CONNECT_FIELDS.get(kind, []),
         "control": _control_schema(kind, sensor.config),
-        "dry_run_default": mgr.ctx.dry_run,
+        # dry-run is UI opt-in; never push server/manager default as checked
+        "dry_run_default": False,
     }
 
 

@@ -41,13 +41,44 @@ def _measure_rate_from_times(times: list[float]) -> float | None:
     return (len(times) - 1) / span
 
 
+def _percentile(sorted_vals: list[float], p: float) -> float | None:
+    if not sorted_vals:
+        return None
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    idx = (len(sorted_vals) - 1) * (p / 100.0)
+    lo = int(math.floor(idx))
+    hi = int(math.ceil(idx))
+    if lo == hi:
+        return sorted_vals[lo]
+    w = idx - lo
+    return sorted_vals[lo] * (1.0 - w) + sorted_vals[hi] * w
+
+
+def _timing_stats(times: list[float]) -> dict[str, Any]:
+    if len(times) < 2:
+        return {"dt_ms_p50": None, "dt_ms_p95": None, "dt_ms_mean": None}
+    dts = sorted((times[i] - times[i - 1]) * 1000.0 for i in range(1, len(times)))
+    mean = sum(dts) / len(dts)
+    return {
+        "dt_ms_p50": None if not dts else round(float(_percentile(dts, 50) or 0.0), 3),
+        "dt_ms_p95": None if not dts else round(float(_percentile(dts, 95) or 0.0), 3),
+        "dt_ms_mean": round(mean, 3),
+    }
+
+
+def _cap_from_measured(measured: float) -> float:
+    return max(0.2, math.floor(float(measured) * 0.95 * 10) / 10)
+
+
 def probe_read_hz(sensor: Any, *, duration_s: float = 10.0) -> dict[str, Any]:
     """Tight sensor.read() loop; return measured Hz and ×0.95 cap."""
     duration_s = max(0.5, float(duration_s))
     times: list[float] = []
     errors = 0
     last_error: str | None = None
-    deadline = time.perf_counter() + duration_s
+    t0 = time.perf_counter()
+    deadline = t0 + duration_s
     while time.perf_counter() < deadline:
         try:
             sensor.read()
@@ -55,25 +86,31 @@ def probe_read_hz(sensor: Any, *, duration_s: float = 10.0) -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             errors += 1
             last_error = str(e)
-            if errors >= 5 and len(times) < 3:
+            if errors >= 8 and len(times) < 3:
                 break
+    elapsed = max(1e-9, time.perf_counter() - t0)
     measured = _measure_rate_from_times(times)
+    stats = _timing_stats(times)
     if measured is None:
         return {
             "ok": False,
             "error": last_error or "read-rate probe failed (too few samples)",
             "samples": len(times),
             "errors": errors,
-            "duration_s": round(duration_s, 3),
+            "duration_s": round(elapsed, 3),
+            "method": "tight_read_loop",
+            **stats,
         }
-    cap = max(0.2, math.floor(measured * 0.95 * 10) / 10)
     return {
         "ok": True,
         "samples": len(times),
         "errors": errors,
-        "duration_s": round(duration_s, 3),
+        "duration_s": round(elapsed, 3),
         "measured_hz": round(measured, 3),
-        "read_cap_hz": cap,
+        "read_cap_hz": _cap_from_measured(measured),
+        "method": "tight_read_loop",
+        "last_error": last_error,
+        **stats,
     }
 
 
@@ -81,7 +118,22 @@ def default_duration_s(kind: str) -> float:
     k = str(kind or "").lower()
     if k == "realsense":
         return 3.0
+    if k in ("ft", "gello"):
+        return 5.0
     return 10.0
+
+
+def _prepare_config_for_probe(kind: str, config: dict[str, Any]) -> dict[str, Any]:
+    """Kind-specific tweaks so the probe measures bus/stream throughput, not UI pacing."""
+    cfg = dict(config)
+    if kind == "ft":
+        # Prefer short waits so a missing frame fails fast; stream probe counts frames.
+        try:
+            cur = int(cfg.get("timeout_ms") or 500)
+        except (TypeError, ValueError):
+            cur = 500
+        cfg["timeout_ms"] = max(20, min(cur, 80))
+    return cfg
 
 
 def _open_sensor(sensor_id: str, kind: str, config: dict[str, Any], dry_run: bool) -> Any:
@@ -112,7 +164,7 @@ def _hardware_fps_cap(kind: str, config: dict[str, Any]) -> float | None:
 def run_job(job: dict[str, Any]) -> dict[str, Any]:
     kind = str(job.get("kind") or "").strip().lower()
     sensor_id = str(job.get("sensor_id") or "sensor")
-    config = dict(job.get("config") or {})
+    config = _prepare_config_for_probe(kind, dict(job.get("config") or {}))
     dry_run = bool(job.get("dry_run", False))
 
     if not kind:
@@ -129,7 +181,13 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
     sensor = None
     try:
         sensor = _open_sensor(sensor_id, kind, config, dry_run)
-        read_probe = probe_read_hz(sensor, duration_s=duration)
+        # Prefer driver-native probe when available (e.g. FT serial frame counting).
+        if hasattr(sensor, "probe_max_read_hz") and callable(getattr(sensor, "probe_max_read_hz")):
+            read_probe = dict(sensor.probe_max_read_hz(duration_s=duration))
+            if read_probe.get("ok") and "read_cap_hz" not in read_probe and read_probe.get("measured_hz"):
+                read_probe["read_cap_hz"] = _cap_from_measured(float(read_probe["measured_hz"]))
+        else:
+            read_probe = probe_read_hz(sensor, duration_s=duration)
         if read_probe.get("ok"):
             hw = _hardware_fps_cap(kind, config)
             if hw is not None and hw > 0:
