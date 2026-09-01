@@ -190,8 +190,8 @@ class GripperWriteProbeRequest(BaseModel):
     value_max: float = 0.637
     baseline_s: float = 1.5
     max_duration_s: float = 25.0
-    sync_duration_s: float = 10.0
-    read_duration_s: float = 10.0
+    sync_duration_s: float = 15.0
+    read_duration_s: float = 15.0
 
 
 class ExportDirBody(BaseModel):
@@ -878,23 +878,20 @@ class ReadRateProbeRequest(BaseModel):
 
 
 def _read_rate_probe_base(sensor_id: str, body: ReadRateProbeRequest) -> tuple[Any, dict[str, Any], bool, float]:
-    from .read_rate_probe import SUPPORTED_KINDS, default_duration_s
+    from .read_rate_probe import SUPPORTED_KINDS, resolve_probe_duration
 
     mgr = get_manager()
     if sensor_id not in mgr.ids():
         raise HTTPException(status_code=404, detail=f"unknown sensor: {sensor_id}")
     base = mgr.get(sensor_id)
     kind = base.kind.value
-    if kind == "arm":
-        raise HTTPException(status_code=400, detail="read-rate probe not enabled for arm yet")
     if kind not in SUPPORTED_KINDS:
         raise HTTPException(status_code=400, detail=f"read-rate probe not supported for kind={kind}")
     overrides = _coerce_overrides(kind, body.config or {})
     merged = {**base.config, **overrides}
     dry_run = mgr.ctx.dry_run if body.dry_run is None else bool(body.dry_run)
-    duration = body.duration_s if body.duration_s is not None else body.read_duration_s
-    if duration is None:
-        duration = default_duration_s(kind)
+    raw_duration = body.duration_s if body.duration_s is not None else body.read_duration_s
+    duration = resolve_probe_duration(raw_duration, kind=kind)
     return base, merged, dry_run, float(duration)
 
 
@@ -1370,6 +1367,28 @@ def _live_sample_connectivity_probe(base: Sensor) -> HealthReport:
     metrics: dict[str, Any] = {"method": "open_read"}
     hints: list[str] = []
 
+    if kind == "realsense":
+        serial = str(config.get("serial") or config.get("endpoint") or "").strip()
+        metrics["serial"] = serial or None
+        if not serial:
+            checks.append(
+                CheckResult(
+                    "serial_required",
+                    False,
+                    "set 相机序列号 (params.serial) — cameras are matched by serial only",
+                    critical=True,
+                )
+            )
+            return HealthReport(
+                sensor_id=sid,
+                kind=kind,
+                status=HealthStatus.OFFLINE,
+                message="serial required",
+                checks=checks,
+                metrics=metrics,
+                hints=["Fill 相机序列号 on the device card, then probe again"],
+            )
+
     _close_sessions_for_sensor(sid)
     sensor = type(base)(sid, config, SensorContext(dry_run=False))
     try:
@@ -1377,6 +1396,8 @@ def _live_sample_connectivity_probe(base: Sensor) -> HealthReport:
         sample = dict(sensor.read())
         checks.append(CheckResult("connect", True, "open+read ok"))
         metrics["sample_keys"] = [str(k) for k in list(sample.keys())[:16]]
+        if kind == "realsense":
+            metrics["active_serial"] = getattr(sensor, "_active_serial", None) or sample.get("serial")
         return HealthReport(
             sensor_id=sid,
             kind=kind,
@@ -1672,9 +1693,9 @@ def api_probe_gripper_read(sensor_id: str, body: GripperWriteProbeRequest) -> di
             "sensor_id": sensor_id,
             "config": merged,
             "dry_run": dry_run,
-            "read_duration_s": float(body.read_duration_s or 10.0),
+            "read_duration_s": float(body.read_duration_s or 15.0),
         },
-        timeout_s=60.0,
+        timeout_s=90.0,
     )
 
 
@@ -1696,7 +1717,7 @@ def api_probe_gripper_write(sensor_id: str, body: GripperWriteProbeRequest) -> d
             "value_max": float(body.value_max),
             "baseline_s": float(body.baseline_s),
             "max_duration_s": float(body.max_duration_s),
-            "sync_duration_s": float(body.sync_duration_s or 10.0),
+            "sync_duration_s": float(body.sync_duration_s or 15.0),
         },
         timeout_s=120.0,
     )
@@ -1709,8 +1730,8 @@ def api_probe_read_rate(sensor_id: str, body: ReadRateProbeRequest) -> dict[str,
 
     base, merged, dry_run, duration = _read_rate_probe_base(sensor_id, body)
     kind = base.kind.value
-    # RealSense frame wait can be slow; allow headroom beyond duration.
-    timeout_s = max(60.0, duration + 30.0)
+    # RealSense frame wait can be slow; allow headroom beyond duration (min 15s probe).
+    timeout_s = max(90.0, duration + 30.0)
     return _run_probe_script(
         ROOT / "scripts" / "probe_read_rate.py",
         {

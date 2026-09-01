@@ -453,10 +453,12 @@
     return kind === "gripper";
   }
 
-  /** Offline max-read probe (button); arm deferred; gripper uses init flow instead. */
+  /** Offline max-read probe (button); gripper uses calibrate+read init flow instead. */
   function isOfflineReadProbeKind(kind) {
-    return kind === "ft" || kind === "tactile" || kind === "realsense" || kind === "gello";
+    return kind === "ft" || kind === "tactile" || kind === "realsense" || kind === "gello" || kind === "arm";
   }
+
+  const PROBE_DURATION_S = 15.0;
 
   function supportsReadCap(kind) {
     return isGripperKind(kind) || isOfflineReadProbeKind(kind);
@@ -1931,7 +1933,7 @@
     const baseBody = {
       config: collectFormConfig(),
       dry_run: dryRunEl.checked,
-      read_duration_s: 10.0,
+      read_duration_s: PROBE_DURATION_S,
     };
     try {
       // 1) calibrate script (worker thread + subprocess)
@@ -2004,8 +2006,7 @@
     const busy = t("control.readProbeBusy");
     if (readProbeHint) readProbeHint.textContent = busy;
     if (formHint) formHint.textContent = busy;
-    const duration_s =
-      currentDevice.kind === "realsense" ? 3.0 : currentDevice.kind === "ft" || currentDevice.kind === "gello" ? 5.0 : 10.0;
+    const duration_s = PROBE_DURATION_S;
     try {
       const res = await fetch(`/api/probe/${encodeURIComponent(currentDevice.id)}/read-rate`, {
         method: "POST",
@@ -2720,7 +2721,7 @@
           value_max: c.value_max ?? 0.637,
           baseline_s: 1.5,
           max_duration_s: 25,
-          sync_duration_s: 10,
+          sync_duration_s: PROBE_DURATION_S,
         }),
       });
       const data = await res.json().catch(() => ({}));

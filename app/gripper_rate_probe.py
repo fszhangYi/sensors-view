@@ -1,4 +1,4 @@
-"""Dedicated gripper rate-probe script (read / write / init+read).
+"""Dedicated gripper rate-probe script (read / write / calibrate) via sensors SDK.
 
 Run standalone:
   python -m app.gripper_rate_probe --job job.json --out out.json
@@ -10,18 +10,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import random
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
-from .read_rate_probe import (  # noqa: F401
-    _measure_rate_from_times,
-    _process_payload,
+from .read_rate_probe import (
+    MIN_PROBE_DURATION_S,
     attach_process_from_probe,
-    probe_read_hz,
+    resolve_probe_duration,
+    run_sdk_read_probe,
 )
 
 
@@ -45,198 +42,18 @@ def _open_gripper(sensor_id: str, config: dict[str, Any], dry_run: bool) -> Any:
     return sensor
 
 
-def probe_write_hz(
-    sensor: Any,
-    *,
-    read_hz: float,
-    write_hz: float,
-    hz_min: float,
-    hz_max: float,
-    value_min: float = 0.0,
-    value_max: float = 0.637,
-    baseline_s: float = 1.5,
-    max_duration_s: float = 25.0,
-    sync_duration_s: float | None = None,
-) -> dict[str, Any]:
-    """Measure max 1:1 sync rate: each cycle is random write then read (same bus).
-
-    The old paced dual-timer design reported *commanded* write_hz (often the UI
-    ceiling, e.g. 40) while reads were only scheduled at the already-capped read
-    rate — so "max sync write" could vastly exceed max read. That is wrong.
-
-    Here we hammer write→read pairs and report the measured cycle Hz (×0.95).
-    """
-    _ = read_hz, write_hz  # kept for API compat; sync probe does not pace by them
-    hz_min = max(0.2, float(hz_min))
-    hz_max = max(hz_min, float(hz_max))
-    lo = float(value_min)
-    hi = float(value_max)
-    if hi < lo:
-        lo, hi = hi, lo
-    baseline_s = max(0.5, float(baseline_s))
-    sync_duration_s = float(sync_duration_s if sync_duration_s is not None else min(10.0, float(max_duration_s)))
-    sync_duration_s = max(3.0, min(float(max_duration_s), sync_duration_s))
-
-    steps: list[dict[str, Any]] = [
-        {
-            "t_s": 0.0,
-            "name": "start",
-            "detail": f"baseline_s={baseline_s} sync_duration_s={sync_duration_s} range=[{lo},{hi}]",
-        }
-    ]
-    # Short read-only baseline for comparison / sanity cap.
-    baseline = probe_read_hz(sensor, duration_s=baseline_s)
-    baseline_read_hz = baseline.get("measured_hz") if baseline.get("ok") else None
-    steps.append(
-        {
-            "t_s": round(float(baseline.get("duration_s") or baseline_s), 3),
-            "name": "baseline_read",
-            "detail": (
-                f"ok={baseline.get('ok')} measured_hz={baseline_read_hz} "
-                f"samples={baseline.get('samples')} errors={baseline.get('errors')}"
-            ),
-        }
-    )
-
-    times: list[float] = []
-    write_ok = 0
-    write_fail = 0
-    read_fail = 0
-    t_start = time.perf_counter()
-    deadline = t_start + sync_duration_s
-    while time.perf_counter() < deadline:
-        target = lo + random.random() * (hi - lo) if hi > lo else lo
-        try:
-            result = dict(sensor.write({"position_norm": target, "wait_ms": 0}))
-            ok = bool(result.get("ok", True)) and not result.get("error")
-        except Exception:  # noqa: BLE001
-            ok = False
-        if not ok:
-            write_fail += 1
-            if write_fail >= 8 and write_ok < 3:
-                steps.append(
-                    {
-                        "t_s": round(time.perf_counter() - t_start, 3),
-                        "name": "abort",
-                        "detail": f"write_fail={write_fail} write_ok={write_ok}",
-                    }
-                )
-                break
-            continue
-        write_ok += 1
-        try:
-            sensor.read()
-            times.append(time.perf_counter())
-        except Exception:  # noqa: BLE001
-            read_fail += 1
-            if read_fail >= 8 and len(times) < 3:
-                steps.append(
-                    {
-                        "t_s": round(time.perf_counter() - t_start, 3),
-                        "name": "abort",
-                        "detail": f"read_fail={read_fail} cycles={len(times)}",
-                    }
-                )
-                break
-
-    measured = _measure_rate_from_times(times)
-    finish_reason = "measured"
-    sync_elapsed = round(time.perf_counter() - t_start, 3)
-    steps.append(
-        {
-            "t_s": sync_elapsed,
-            "name": "sync_write_read",
-            "detail": (
-                f"cycles={len(times)} write_ok={write_ok} "
-                f"write_fail={write_fail} read_fail={read_fail}"
-            ),
-        }
-    )
-    if measured is None:
-        steps.append({"t_s": sync_elapsed, "name": "failed", "detail": "too few successful write→read cycles"})
-        return {
-            "ok": False,
-            "error": "sync write-rate probe failed (too few successful write→read cycles)",
-            "finish_reason": "too_few_samples",
-            "duration_s": sync_elapsed,
-            "baseline_read_hz": None if baseline_read_hz is None else round(float(baseline_read_hz), 3),
-            "read_samples": 0,
-            "write_samples": write_ok,
-            "write_fail": write_fail,
-            "read_fail": read_fail,
-            "max_sync_write_hz": None,
-            "process": _process_payload(
-                steps=steps,
-                times=times,
-                extra={"baseline": baseline.get("process") or baseline, "summary": {"ok": False}},
-            ),
-        }
-
-    # Margin + clamp to UI bounds; never claim sync faster than read-only baseline.
-    cap = max(0.2, math.floor(measured * 0.95 * 10) / 10)
-    if baseline_read_hz is not None and baseline_read_hz > 0:
-        cap = min(cap, math.floor(float(baseline_read_hz) * 0.95 * 10) / 10)
-    cap = min(hz_max, max(hz_min, cap))
-    if abs(cap - hz_max) < 0.05 and measured * 0.95 >= hz_max - 0.05:
-        finish_reason = "ceiling"
-
-    steps.append(
-        {
-            "t_s": sync_elapsed,
-            "name": "done",
-            "detail": (
-                f"write_measured_hz={round(measured, 3)} max_sync_write_hz={round(cap, 3)} "
-                f"finish_reason={finish_reason}"
-            ),
-        }
-    )
-    summary = {
-        "ok": True,
-        "finish_reason": finish_reason,
-        "write_measured_hz": round(measured, 3),
-        "max_sync_write_hz": round(cap, 3),
-        "baseline_read_hz": None if baseline_read_hz is None else round(float(baseline_read_hz), 3),
-        "read_samples": len(times),
-        "write_samples": write_ok,
-        "write_fail": write_fail,
-        "read_fail": read_fail,
-        "duration_s": sync_elapsed,
-    }
-    return {
-        "ok": True,
-        "finish_reason": finish_reason,
-        "duration_s": sync_elapsed,
-        "sync_duration_s": round(sync_duration_s, 3),
-        "read_hz": None,
-        "write_hz_final": round(cap, 3),
-        "read_measured_hz": None if baseline_read_hz is None else round(float(baseline_read_hz), 3),
-        "write_measured_hz": round(measured, 3),
-        "baseline_read_hz": None if baseline_read_hz is None else round(float(baseline_read_hz), 3),
-        "max_sync_write_hz": round(cap, 3),
-        "read_samples": len(times),
-        "write_samples": write_ok,
-        "write_fail": write_fail,
-        "read_fail": read_fail,
-        "process": _process_payload(
-            steps=steps,
-            times=times,
-            extra={"baseline": baseline.get("process") or {"summary": baseline}, "summary": summary},
-        ),
-    }
-
-
 def run_job(job: dict[str, Any]) -> dict[str, Any]:
     """Execute one probe job. Called from a worker thread or CLI."""
     mode = str(job.get("mode") or "").strip().lower()
     sensor_id = str(job.get("sensor_id") or "gripper")
     config = dict(job.get("config") or {})
     dry_run = bool(job.get("dry_run", False))
+    read_duration_s = resolve_probe_duration(job.get("read_duration_s"), kind="gripper")
 
     sensor = None
     try:
         sensor = _open_gripper(sensor_id, config, dry_run)
         if mode in ("calibrate", "init"):
-            # "init" kept as alias for calibrate-only; read probe is a separate script run.
             calibrate = dict(sensor.write({"calibrate": True}))
             if not calibrate.get("ok", True):
                 return {
@@ -262,10 +79,14 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
                 "via": "gripper_rate_probe_script",
                 "mode": "calibrate",
             }
-            # Legacy: mode=init may still request an embedded read probe.
             if mode == "init" and bool(job.get("embed_read_probe")):
+                if not dry_run:
+                    try:
+                        sensor.initialize()
+                    except Exception:  # noqa: BLE001
+                        pass
                 read_probe = attach_process_from_probe(
-                    probe_read_hz(sensor, duration_s=float(job.get("read_duration_s") or 10.0)),
+                    run_sdk_read_probe(sensor, duration_s=read_duration_s, kind="gripper", config=cfg_out),
                     kind="gripper",
                 )
                 out["read_probe"] = read_probe
@@ -275,21 +96,24 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             return out
 
         if mode == "write":
-            init = dict(sensor.write({"initialize": True}))
-            write_probe = probe_write_hz(
-                sensor,
-                read_hz=float(job.get("read_hz") or 8),
-                write_hz=float(job.get("write_hz") or 8),
-                hz_min=float(job.get("hz_min") or 1),
-                hz_max=float(job.get("hz_max") or 200),
-                value_min=float(job.get("value_min") or 0.0),
-                value_max=float(job.get("value_max") or 0.637),
-                baseline_s=float(job.get("baseline_s") or 1.5),
-                max_duration_s=float(job.get("max_duration_s") or 25.0),
-                sync_duration_s=float(job["sync_duration_s"]) if job.get("sync_duration_s") is not None else 10.0,
+            init = dict(sensor.initialize())
+            sync_duration_s = resolve_probe_duration(
+                job.get("sync_duration_s") if job.get("sync_duration_s") is not None else job.get("max_duration_s"),
+                kind="gripper",
             )
+            write_probe = dict(
+                sensor.probe_max_sync_write_hz(
+                    duration_s=sync_duration_s,
+                    baseline_s=float(job.get("baseline_s") or 1.5),
+                    value_min=float(job.get("value_min") or 0.0),
+                    value_max=float(job.get("value_max") or 0.637),
+                    hz_min=float(job.get("hz_min") or 1.0),
+                    hz_max=float(job.get("hz_max") or 200.0),
+                )
+            )
+            write_probe = attach_process_from_probe(write_probe, kind="gripper")
             return {
-                "ok": True,
+                "ok": bool(write_probe.get("ok")),
                 "id": sensor_id,
                 "kind": "gripper",
                 "dry_run": dry_run,
@@ -298,17 +122,17 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
                 "write_probe": write_probe,
                 "via": "gripper_rate_probe_script",
                 "mode": "write",
+                "error": write_probe.get("error"),
             }
 
         if mode == "read":
-            # Optional: ensure Modbus init before hammering reads on live hardware.
             if not dry_run:
                 try:
-                    sensor.write({"initialize": True})
+                    sensor.initialize()
                 except Exception:  # noqa: BLE001
                     pass
             read_probe = attach_process_from_probe(
-                probe_read_hz(sensor, duration_s=float(job.get("read_duration_s") or 10.0)),
+                run_sdk_read_probe(sensor, duration_s=read_duration_s, kind="gripper", config=config),
                 kind="gripper",
             )
             return {
