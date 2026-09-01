@@ -172,6 +172,13 @@ class UserUpdateBody(BaseModel):
     password: str | None = None
 
 
+class ProbeRequest(BaseModel):
+    """Overview connectivity probe — same bar as 单次采样 (open+read with current config)."""
+
+    id: str | None = None
+    configs: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
 class GripperWriteProbeRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     dry_run: bool | None = None
@@ -682,6 +689,12 @@ def _control_schema(kind: str, config: dict[str, Any]) -> dict[str, Any]:
 def _public_config(cfg: dict[str, Any]) -> dict[str, Any]:
     skip = {"role_serials", "name", "enabled", "kind", "id"}
     return {k: v for k, v in cfg.items() if k not in skip and not str(k).startswith("_")}
+
+
+def _merged_connect_config(base: Sensor, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    kind = base.kind.value
+    coerced = _coerce_overrides(kind, overrides or {})
+    return {**dict(base.config), **coerced}
 
 
 def _pack_sample_response(
@@ -1245,7 +1258,23 @@ def api_postprocess_job(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/probe")
-def api_probe(id: str | None = Query(default=None)) -> dict[str, Any]:
+def api_probe_get(id: str | None = Query(default=None)) -> dict[str, Any]:
+    """Legacy GET probe (YAML defaults only). Prefer POST with saved card configs."""
+    return _run_connectivity_probe(only=[id] if id else None, configs={})
+
+
+@app.post("/api/probe")
+def api_probe_post(body: ProbeRequest) -> dict[str, Any]:
+    """Per-device connection check using UI/card config overrides."""
+    only = [body.id] if body.id else None
+    return _run_connectivity_probe(only=only, configs=body.configs or {})
+
+
+def _run_connectivity_probe(
+    *,
+    only: list[str] | None,
+    configs: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
     """Per-device connection check for the overview cards.
 
     Semantics (real hardware, never dry-run):
@@ -1254,20 +1283,29 @@ def api_probe(id: str | None = Query(default=None)) -> dict[str, Any]:
       warn    — connected, but other non-critical anomalies remain
     """
     mgr = get_manager()
-    only = [id] if id else None
     wanted = set(only) if only else None
     bases = [s for s in mgr if wanted is None or s.id in wanted]
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     by_id: dict[str, HealthReport] = {}
+    config_used: dict[str, dict[str, Any]] = {}
     workers = min(4, max(1, len(bases)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_connectivity_probe_device, b): b.id for b in bases}
+        futs = {
+            pool.submit(
+                _connectivity_probe_device,
+                b,
+                configs.get(b.id) or {},
+            ): b.id
+            for b in bases
+        }
         for fut in as_completed(futs):
             sid = futs[fut]
             try:
-                by_id[sid] = fut.result()
+                report, used_cfg = fut.result()
+                by_id[sid] = report
+                config_used[sid] = used_cfg
             except Exception as e:  # noqa: BLE001
                 by_id[sid] = HealthReport(
                     sensor_id=sid,
@@ -1276,6 +1314,7 @@ def api_probe(id: str | None = Query(default=None)) -> dict[str, Any]:
                     message=str(e),
                     checks=[CheckResult("connect", False, str(e), critical=True)],
                 )
+                config_used[sid] = {}
 
     devices: list[dict[str, Any]] = []
     order = only if only else mgr.ids()
@@ -1287,11 +1326,13 @@ def api_probe(id: str | None = Query(default=None)) -> dict[str, Any]:
         try:
             sensor = mgr.get(sid)
             d["name"] = sensor.name
-            d["config"] = _public_config(sensor.config)
+            d["config"] = _public_config(config_used.get(sid) or sensor.config)
+            d["config_used"] = d["config"]
             d["kind"] = sensor.kind.value
         except KeyError:
             d["name"] = sid
-            d["config"] = {}
+            d["config"] = _public_config(config_used.get(sid) or {})
+            d["config_used"] = d["config"]
         devices.append(d)
     return {"site": mgr.bundle.site, "dry_run": mgr.ctx.dry_run, "devices": devices}
 
@@ -1336,30 +1377,6 @@ def _live_sample_connectivity_probe(base: Sensor) -> HealthReport:
         sample = dict(sensor.read())
         checks.append(CheckResult("connect", True, "open+read ok"))
         metrics["sample_keys"] = [str(k) for k in list(sample.keys())[:16]]
-
-        # Soft anomalies after a successful sample → warn (not offline).
-        shallow = type(base)(sid, config, SensorContext(dry_run=False)).probe()
-        hints = list(shallow.hints or [])
-        soft = [c for c in shallow.checks if not c.ok]
-        for c in soft:
-            checks.append(
-                CheckResult(
-                    name=c.name,
-                    ok=False,
-                    detail=c.detail,
-                    critical=False,
-                )
-            )
-        if soft:
-            return HealthReport(
-                sensor_id=sid,
-                kind=kind,
-                status=HealthStatus.WARN,
-                message=shallow.message or "connected with warnings",
-                checks=checks,
-                metrics={**dict(shallow.metrics), **metrics},
-                hints=hints,
-            )
         return HealthReport(
             sensor_id=sid,
             kind=kind,
@@ -1388,11 +1405,16 @@ def _live_sample_connectivity_probe(base: Sensor) -> HealthReport:
             pass
 
 
-def _connectivity_probe_device(base: Sensor) -> HealthReport:
-    kind = str(base.kind.value).lower()
+def _connectivity_probe_device(
+    base: Sensor,
+    overrides: dict[str, Any] | None = None,
+) -> tuple[HealthReport, dict[str, Any]]:
+    config = _merged_connect_config(base, overrides)
+    merged = type(base)(base.id, config, base.ctx)
+    kind = str(merged.kind.value).lower()
     if kind in _SHALLOW_CONNECT_KINDS or kind not in _LIVE_CONNECT_KINDS:
-        return _shallow_connectivity_probe(base)
-    return _live_sample_connectivity_probe(base)
+        return _shallow_connectivity_probe(merged), config
+    return _live_sample_connectivity_probe(merged), config
 
 
 @app.get("/api/device/{sensor_id}")

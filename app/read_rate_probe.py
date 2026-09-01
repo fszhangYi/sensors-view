@@ -67,6 +67,99 @@ def _timing_stats(times: list[float]) -> dict[str, Any]:
     }
 
 
+def _downsample_dt_ms(times: list[float], *, max_points: int = 200) -> list[float]:
+    """Downsample inter-sample intervals (ms) so process payload stays small."""
+    if len(times) < 2:
+        return []
+    dts = [(times[i] - times[i - 1]) * 1000.0 for i in range(1, len(times))]
+    if len(dts) <= max_points:
+        return [round(d, 3) for d in dts]
+    step = len(dts) / float(max_points)
+    return [round(dts[min(len(dts) - 1, int(i * step))], 3) for i in range(max_points)]
+
+
+def _process_payload(
+    *,
+    steps: list[dict[str, Any]],
+    times: list[float] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {"steps": steps}
+    if times is not None:
+        out["dt_ms_series"] = _downsample_dt_ms(times)
+        out["dt_ms_series_n"] = max(0, len(times) - 1)
+    if extra:
+        out.update(extra)
+    return out
+
+
+def attach_process_from_probe(probe: dict[str, Any], *, kind: str | None = None) -> dict[str, Any]:
+    """Ensure probe dict has a ``process`` block (synthesize if driver-native)."""
+    if not isinstance(probe, dict):
+        return probe
+    if isinstance(probe.get("process"), dict) and probe["process"].get("steps"):
+        return probe
+    method = str(probe.get("method") or "unknown")
+    duration = probe.get("duration_s")
+    samples = probe.get("samples")
+    steps: list[dict[str, Any]] = [
+        {"t_s": 0.0, "name": "start", "detail": f"method={method}" + (f" kind={kind}" if kind else "")},
+        {
+            "t_s": round(float(duration or 0.0), 3),
+            "name": "loop",
+            "detail": f"samples={samples} errors={probe.get('errors', 0)}",
+        },
+    ]
+    if probe.get("ok"):
+        steps.append(
+            {
+                "t_s": round(float(duration or 0.0), 3),
+                "name": "done",
+                "detail": (
+                    f"measured_hz={probe.get('measured_hz')} "
+                    f"read_cap_hz={probe.get('read_cap_hz')} "
+                    f"dt_ms_p50={probe.get('dt_ms_p50')} "
+                    f"dt_ms_p95={probe.get('dt_ms_p95')}"
+                ).strip(),
+            }
+        )
+    else:
+        steps.append(
+            {
+                "t_s": round(float(duration or 0.0), 3),
+                "name": "failed",
+                "detail": str(probe.get("error") or "probe failed"),
+            }
+        )
+    probe = {
+        **probe,
+        "process": _process_payload(
+            steps=steps,
+            extra={
+                "summary": {
+                    k: probe.get(k)
+                    for k in (
+                        "ok",
+                        "method",
+                        "samples",
+                        "errors",
+                        "duration_s",
+                        "measured_hz",
+                        "read_cap_hz",
+                        "hardware_fps_cap",
+                        "dt_ms_p50",
+                        "dt_ms_p95",
+                        "dt_ms_mean",
+                        "last_error",
+                    )
+                    if k in probe
+                }
+            },
+        ),
+    }
+    return probe
+
+
 def _cap_from_measured(measured: float) -> float:
     return max(0.2, math.floor(float(measured) * 0.95 * 10) / 10)
 
@@ -77,7 +170,9 @@ def probe_read_hz(sensor: Any, *, duration_s: float = 10.0) -> dict[str, Any]:
     times: list[float] = []
     errors = 0
     last_error: str | None = None
+    steps: list[dict[str, Any]] = []
     t0 = time.perf_counter()
+    steps.append({"t_s": 0.0, "name": "start", "detail": f"duration_s={duration_s}"})
     deadline = t0 + duration_s
     while time.perf_counter() < deadline:
         try:
@@ -87,11 +182,32 @@ def probe_read_hz(sensor: Any, *, duration_s: float = 10.0) -> dict[str, Any]:
             errors += 1
             last_error = str(e)
             if errors >= 8 and len(times) < 3:
+                steps.append(
+                    {
+                        "t_s": round(time.perf_counter() - t0, 3),
+                        "name": "abort",
+                        "detail": f"too many errors ({errors}): {last_error}",
+                    }
+                )
                 break
     elapsed = max(1e-9, time.perf_counter() - t0)
     measured = _measure_rate_from_times(times)
     stats = _timing_stats(times)
+    steps.append(
+        {
+            "t_s": round(elapsed, 3),
+            "name": "loop_end",
+            "detail": f"samples={len(times)} errors={errors}",
+        }
+    )
     if measured is None:
+        steps.append(
+            {
+                "t_s": round(elapsed, 3),
+                "name": "failed",
+                "detail": last_error or "too few samples",
+            }
+        )
         return {
             "ok": False,
             "error": last_error or "read-rate probe failed (too few samples)",
@@ -99,17 +215,40 @@ def probe_read_hz(sensor: Any, *, duration_s: float = 10.0) -> dict[str, Any]:
             "errors": errors,
             "duration_s": round(elapsed, 3),
             "method": "tight_read_loop",
+            "process": _process_payload(steps=steps, times=times),
             **stats,
         }
+    cap = _cap_from_measured(measured)
+    steps.append(
+        {
+            "t_s": round(elapsed, 3),
+            "name": "done",
+            "detail": f"measured_hz={round(measured, 3)} read_cap_hz={cap}",
+        }
+    )
     return {
         "ok": True,
         "samples": len(times),
         "errors": errors,
         "duration_s": round(elapsed, 3),
         "measured_hz": round(measured, 3),
-        "read_cap_hz": _cap_from_measured(measured),
+        "read_cap_hz": cap,
         "method": "tight_read_loop",
         "last_error": last_error,
+        "process": _process_payload(
+            steps=steps,
+            times=times,
+            extra={
+                "summary": {
+                    "measured_hz": round(measured, 3),
+                    "read_cap_hz": cap,
+                    "samples": len(times),
+                    "errors": errors,
+                    "duration_s": round(elapsed, 3),
+                    **stats,
+                }
+            },
+        ),
         **stats,
     }
 
@@ -193,6 +332,7 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             if hw is not None and hw > 0:
                 cap = min(float(read_probe["read_cap_hz"]), math.floor(hw * 10) / 10)
                 read_probe = {**read_probe, "read_cap_hz": cap, "hardware_fps_cap": hw}
+        read_probe = attach_process_from_probe(read_probe, kind=kind)
         return {
             "ok": bool(read_probe.get("ok")),
             "id": sensor_id,

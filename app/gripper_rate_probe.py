@@ -17,7 +17,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .read_rate_probe import _measure_rate_from_times, probe_read_hz  # noqa: F401
+from .read_rate_probe import (  # noqa: F401
+    _measure_rate_from_times,
+    _process_payload,
+    attach_process_from_probe,
+    probe_read_hz,
+)
 
 
 def _ensure_sensors_path() -> Path:
@@ -72,9 +77,26 @@ def probe_write_hz(
     sync_duration_s = float(sync_duration_s if sync_duration_s is not None else min(10.0, float(max_duration_s)))
     sync_duration_s = max(3.0, min(float(max_duration_s), sync_duration_s))
 
+    steps: list[dict[str, Any]] = [
+        {
+            "t_s": 0.0,
+            "name": "start",
+            "detail": f"baseline_s={baseline_s} sync_duration_s={sync_duration_s} range=[{lo},{hi}]",
+        }
+    ]
     # Short read-only baseline for comparison / sanity cap.
     baseline = probe_read_hz(sensor, duration_s=baseline_s)
     baseline_read_hz = baseline.get("measured_hz") if baseline.get("ok") else None
+    steps.append(
+        {
+            "t_s": round(float(baseline.get("duration_s") or baseline_s), 3),
+            "name": "baseline_read",
+            "detail": (
+                f"ok={baseline.get('ok')} measured_hz={baseline_read_hz} "
+                f"samples={baseline.get('samples')} errors={baseline.get('errors')}"
+            ),
+        }
+    )
 
     times: list[float] = []
     write_ok = 0
@@ -92,6 +114,13 @@ def probe_write_hz(
         if not ok:
             write_fail += 1
             if write_fail >= 8 and write_ok < 3:
+                steps.append(
+                    {
+                        "t_s": round(time.perf_counter() - t_start, 3),
+                        "name": "abort",
+                        "detail": f"write_fail={write_fail} write_ok={write_ok}",
+                    }
+                )
                 break
             continue
         write_ok += 1
@@ -101,22 +130,46 @@ def probe_write_hz(
         except Exception:  # noqa: BLE001
             read_fail += 1
             if read_fail >= 8 and len(times) < 3:
+                steps.append(
+                    {
+                        "t_s": round(time.perf_counter() - t_start, 3),
+                        "name": "abort",
+                        "detail": f"read_fail={read_fail} cycles={len(times)}",
+                    }
+                )
                 break
 
     measured = _measure_rate_from_times(times)
     finish_reason = "measured"
+    sync_elapsed = round(time.perf_counter() - t_start, 3)
+    steps.append(
+        {
+            "t_s": sync_elapsed,
+            "name": "sync_write_read",
+            "detail": (
+                f"cycles={len(times)} write_ok={write_ok} "
+                f"write_fail={write_fail} read_fail={read_fail}"
+            ),
+        }
+    )
     if measured is None:
+        steps.append({"t_s": sync_elapsed, "name": "failed", "detail": "too few successful write→read cycles"})
         return {
             "ok": False,
             "error": "sync write-rate probe failed (too few successful write→read cycles)",
             "finish_reason": "too_few_samples",
-            "duration_s": round(time.perf_counter() - t_start, 3),
+            "duration_s": sync_elapsed,
             "baseline_read_hz": None if baseline_read_hz is None else round(float(baseline_read_hz), 3),
             "read_samples": 0,
             "write_samples": write_ok,
             "write_fail": write_fail,
             "read_fail": read_fail,
             "max_sync_write_hz": None,
+            "process": _process_payload(
+                steps=steps,
+                times=times,
+                extra={"baseline": baseline.get("process") or baseline, "summary": {"ok": False}},
+            ),
         }
 
     # Margin + clamp to UI bounds; never claim sync faster than read-only baseline.
@@ -127,10 +180,32 @@ def probe_write_hz(
     if abs(cap - hz_max) < 0.05 and measured * 0.95 >= hz_max - 0.05:
         finish_reason = "ceiling"
 
+    steps.append(
+        {
+            "t_s": sync_elapsed,
+            "name": "done",
+            "detail": (
+                f"write_measured_hz={round(measured, 3)} max_sync_write_hz={round(cap, 3)} "
+                f"finish_reason={finish_reason}"
+            ),
+        }
+    )
+    summary = {
+        "ok": True,
+        "finish_reason": finish_reason,
+        "write_measured_hz": round(measured, 3),
+        "max_sync_write_hz": round(cap, 3),
+        "baseline_read_hz": None if baseline_read_hz is None else round(float(baseline_read_hz), 3),
+        "read_samples": len(times),
+        "write_samples": write_ok,
+        "write_fail": write_fail,
+        "read_fail": read_fail,
+        "duration_s": sync_elapsed,
+    }
     return {
         "ok": True,
         "finish_reason": finish_reason,
-        "duration_s": round(time.perf_counter() - t_start, 3),
+        "duration_s": sync_elapsed,
         "sync_duration_s": round(sync_duration_s, 3),
         "read_hz": None,
         "write_hz_final": round(cap, 3),
@@ -142,6 +217,11 @@ def probe_write_hz(
         "write_samples": write_ok,
         "write_fail": write_fail,
         "read_fail": read_fail,
+        "process": _process_payload(
+            steps=steps,
+            times=times,
+            extra={"baseline": baseline.get("process") or {"summary": baseline}, "summary": summary},
+        ),
     }
 
 
@@ -184,7 +264,10 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             }
             # Legacy: mode=init may still request an embedded read probe.
             if mode == "init" and bool(job.get("embed_read_probe")):
-                read_probe = probe_read_hz(sensor, duration_s=float(job.get("read_duration_s") or 10.0))
+                read_probe = attach_process_from_probe(
+                    probe_read_hz(sensor, duration_s=float(job.get("read_duration_s") or 10.0)),
+                    kind="gripper",
+                )
                 out["read_probe"] = read_probe
                 if not read_probe.get("ok"):
                     out["ok"] = False
@@ -224,7 +307,10 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
                     sensor.write({"initialize": True})
                 except Exception:  # noqa: BLE001
                     pass
-            read_probe = probe_read_hz(sensor, duration_s=float(job.get("read_duration_s") or 10.0))
+            read_probe = attach_process_from_probe(
+                probe_read_hz(sensor, duration_s=float(job.get("read_duration_s") or 10.0)),
+                kind="gripper",
+            )
             return {
                 "ok": bool(read_probe.get("ok")),
                 "id": sensor_id,

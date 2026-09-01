@@ -54,3 +54,15 @@ read_cap_hz = floor(measured_hz × 0.95 × 10) / 10
 ### 与连续采样的关系
 
 连续采样仍走 HTTP tick，只读可视化/落盘；测速结果只用来设定读频上限（夹爪另可展示最大同步写频）。采样路径本身不参与寻峰。
+
+### 过程数据回传
+
+测速结果 JSON 中带 `process` 字段，供前端弹框折叠展示：
+
+```text
+process.steps[]          # { t_s, name, detail } 阶段时间线
+process.dt_ms_series[]   # 间隔采样（最多约 200 点，避免过大）
+process.summary          # 关键指标摘要
+```
+
+通用紧循环与夹爪写测会写入完整 steps + 间隔序列；驱动原生测读（FT/Gello）若未自带 process，由 `attach_process_from_probe` 用汇总字段合成。

@@ -563,6 +563,69 @@ main {
   color: var(--text);
   font-weight: 650;
 }
+.probe-process {
+  margin-top: 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  padding: 0.45rem 0.65rem 0.55rem;
+}
+.probe-process[hidden] {
+  display: none !important;
+}
+.probe-process summary {
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  letter-spacing: 0.03em;
+  list-style: none;
+}
+.probe-process summary::-webkit-details-marker {
+  display: none;
+}
+.probe-process summary::before {
+  content: "▸ ";
+  color: var(--accent);
+}
+.probe-process[open] summary::before {
+  content: "▾ ";
+}
+.probe-process-body {
+  margin-top: 0.45rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+.probe-process-steps {
+  margin: 0;
+  padding-left: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.probe-process-steps li {
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: var(--text);
+}
+.probe-process-steps .step-t {
+  font-family: var(--mono);
+  color: var(--muted);
+  margin-right: 0.35rem;
+}
+.probe-process-steps .step-name {
+  font-weight: 650;
+  color: var(--accent);
+  margin-right: 0.35rem;
+}
+.probe-process-steps .step-detail {
+  color: var(--muted);
+}
+.probe-process #probe-process-json {
+  max-height: 220px;
+  margin: 0;
+}
 .btn-write-probe {
   margin-top: 0.25rem;
   align-self: flex-start;

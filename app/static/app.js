@@ -104,6 +104,9 @@
   const readProbeRow = document.getElementById("read-probe-row");
   const btnReadProbe = document.getElementById("btn-read-probe");
   const readProbeHint = document.getElementById("read-probe-hint");
+  const probeProcessEl = document.getElementById("probe-process");
+  const probeProcessStepsEl = document.getElementById("probe-process-steps");
+  const probeProcessJsonEl = document.getElementById("probe-process-json");
 
   const RATE_PREFS_KEY = "sensors-view.ratePrefs";
   const CONNECT_CFG_KEY = "sensors-view.connectConfig";
@@ -1189,11 +1192,19 @@
   }
 
   async function probeOne(id) {
-    const res = await fetch(`/api/probe?id=${encodeURIComponent(id)}`);
+    const res = await fetch("/api/probe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id,
+        configs: collectProbeConfigs([id]),
+      }),
+    });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `probe ${res.status}`);
     const d = (data.devices || [])[0];
     if (!d) throw new Error(`no probe result for ${id}`);
+    if (d.config_used) saveDeviceConfig(id, d.config_used);
     return d;
   }
 
@@ -1202,7 +1213,7 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        config: {},
+        config: loadDeviceConfig(id),
         dry_run: !!batchDryRunEl?.checked,
       }),
     });
@@ -1845,6 +1856,7 @@
     const dur = probe.duration_s ?? "—";
     const method = probe.method || "tight_read_loop";
     const measTxt = Number.isFinite(measured) ? formatMeasured(measured) : "—";
+    showProbeProcess(probe, { kind: "read", envelope: data });
     return t("control.readProbeDoneDetail", {
       measured: measTxt,
       cap: formatMeasured(cap),
@@ -1853,6 +1865,57 @@
       method,
       dry: dry ? "dry-run" : "live",
     });
+  }
+
+  function clearProbeProcess() {
+    if (probeProcessEl) {
+      probeProcessEl.hidden = true;
+      probeProcessEl.open = false;
+    }
+    if (probeProcessStepsEl) probeProcessStepsEl.innerHTML = "";
+    if (probeProcessJsonEl) probeProcessJsonEl.textContent = "{}";
+  }
+
+  function showProbeProcess(probe, { kind = "read", envelope = null } = {}) {
+    if (!probeProcessEl || !probeProcessJsonEl) return;
+    const process = probe?.process && typeof probe.process === "object" ? probe.process : null;
+    const payload = {
+      kind: kind === "write" ? "write" : "read",
+      kind_label: kind === "write" ? t("probe.process.kind.write") : t("probe.process.kind.read"),
+      probe: {
+        ok: probe?.ok ?? null,
+        method: probe?.method ?? null,
+        measured_hz: probe?.measured_hz ?? probe?.write_measured_hz ?? null,
+        read_cap_hz: probe?.read_cap_hz ?? null,
+        max_sync_write_hz: probe?.max_sync_write_hz ?? null,
+        samples: probe?.samples ?? probe?.read_samples ?? null,
+        errors: probe?.errors ?? null,
+        duration_s: probe?.duration_s ?? null,
+        dt_ms_p50: probe?.dt_ms_p50 ?? null,
+        dt_ms_p95: probe?.dt_ms_p95 ?? null,
+        dt_ms_mean: probe?.dt_ms_mean ?? null,
+        finish_reason: probe?.finish_reason ?? null,
+        error: probe?.error ?? null,
+      },
+      process: process || { steps: [], note: t("probe.process.empty") },
+      via: envelope?.via ?? null,
+      dry_run: envelope?.dry_run ?? probe?.dry_run ?? null,
+    };
+    const steps = Array.isArray(process?.steps) ? process.steps : [];
+    if (probeProcessStepsEl) {
+      probeProcessStepsEl.innerHTML = steps.length
+        ? steps
+            .map((s) => {
+              const tRel = s?.t_s != null ? `${Number(s.t_s).toFixed(3)}s` : "—";
+              const name = escapeHtml(String(s?.name || "step"));
+              const detail = s?.detail != null ? escapeHtml(String(s.detail)) : "";
+              return `<li><span class="step-t">${escapeHtml(tRel)}</span><span class="step-name">${name}</span><span class="step-detail">${detail}</span></li>`;
+            })
+            .join("")
+        : `<li class="step-detail">${escapeHtml(t("probe.process.empty"))}</li>`;
+    }
+    probeProcessJsonEl.textContent = JSON.stringify(payload, null, 2);
+    probeProcessEl.hidden = false;
   }
 
   async function calibrateGripper() {
@@ -1900,7 +1963,10 @@
       const readData = await readRes.json().catch(() => ({}));
       if (!readRes.ok) throw new Error(readData.detail || `HTTP ${readRes.status}`);
       const probe = readData.read_probe || {};
-      if (probe.ok === false) throw new Error(probe.error || t("control.readProbeFailed"));
+      if (probe.ok === false) {
+        showProbeProcess(probe, { kind: "read", envelope: readData });
+        throw new Error(probe.error || t("control.readProbeFailed"));
+      }
       const doneRead = applyReadProbeResult(probe, readData);
       const doneInit = t("control.gripperInitDone", {
         min: cr.position_raw_min ?? "—",
@@ -1953,7 +2019,10 @@
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       const probe = data.read_probe || {};
-      if (probe.ok === false) throw new Error(probe.error || t("control.readProbeFailed"));
+      if (probe.ok === false) {
+        showProbeProcess(probe, { kind: "read", envelope: data });
+        throw new Error(probe.error || t("control.readProbeFailed"));
+      }
       const msg = applyReadProbeResult(probe, data);
       if (readProbeHint) readProbeHint.textContent = msg;
       if (formHint) formHint.textContent = msg;
@@ -2096,6 +2165,16 @@
     } catch {
       return {};
     }
+  }
+
+  function collectProbeConfigs(ids = null) {
+    const configs = {};
+    const targets = ids?.length ? ids : (lastDevices || []).map((d) => d.id);
+    for (const id of targets) {
+      const saved = loadDeviceConfig(id);
+      if (saved && Object.keys(saved).length) configs[id] = saved;
+    }
+    return configs;
   }
 
   function saveDeviceConfig(id, cfg) {
@@ -2663,6 +2742,7 @@
         maxSyncWriteHz: Number.isFinite(maxHz) ? maxHz : null,
         writeTargetHz: Number.isFinite(maxHz) ? maxHz : prefs.writeHz,
       });
+      showProbeProcess(probe, { kind: "write", envelope: data });
       const msg =
         Number.isFinite(maxHz) && maxHz > 0
           ? t("control.writeProbeDone", { hz: formatMeasured(maxHz) })
@@ -2822,6 +2902,7 @@
     streamStatus.textContent = "";
     lastPayload = null;
     clearStreamRecords();
+    clearProbeProcess();
     commandHint.textContent = "";
     if (gripperInitHint) gripperInitHint.textContent = t("control.gripperInitHint");
     try {
@@ -2911,6 +2992,7 @@
 
   async function closeModal() {
     persistCurrentFormConfig();
+    clearProbeProcess();
     modal.hidden = true;
     await stopStream({ quiet: true });
   }
@@ -2943,10 +3025,18 @@
     busy = true;
     btnRefresh.disabled = true;
     try {
+      persistCurrentFormConfig();
       await loadMeta();
-      const res = await fetch("/api/probe");
+      const res = await fetch("/api/probe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ configs: collectProbeConfigs() }),
+      });
       if (!res.ok) throw new Error(`probe ${res.status}`);
       const data = await res.json();
+      for (const d of data.devices || []) {
+        if (d.id && d.config_used) saveDeviceConfig(d.id, d.config_used);
+      }
       renderSummary(data.devices || []);
       renderCards(data.devices || []);
       setText("meta-updated", new Date().toLocaleTimeString(window.SensorsI18n?.getLocale?.() === "en" ? "en-US" : "zh-CN"));

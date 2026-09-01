@@ -220,6 +220,14 @@
           <span class="form-hint" id="read-probe-hint" data-i18n="control.readProbeHint">独立脚本紧循环读，结果回传后设为读取上限（机械臂暂不支持）</span>
         </div>
 
+        <details class="probe-process" id="probe-process" hidden>
+          <summary data-i18n="probe.process.title">测速过程数据</summary>
+          <div class="probe-process-body">
+            <ol class="probe-process-steps" id="probe-process-steps"></ol>
+            <pre id="probe-process-json" class="sample-out light">{}</pre>
+          </div>
+        </details>
+
         <section class="gripper-io-panel" id="gripper-io-panel" hidden>
           <div class="preview-head">
             <p class="brand tiny" data-i18n="gripperIo.kicker">gripper · read / write</p>
