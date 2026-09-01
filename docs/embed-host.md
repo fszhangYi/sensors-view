@@ -2,13 +2,22 @@
 
 sensors-view 在检测到自己处于 iframe 中时：
 
-- 显示红点跳动的 `iframe` 标记
-- **隐藏**：退出、用户、中英文切换、深浅色切换
-- **语言 / 主题跟随宿主**（不写回 localStorage）
+- **显示当前是 iframe 状态**：红点跳动的 `iframe` 标记
+- **隐藏敏感功能**：退出、用户、中英文切换、深浅色切换（及用户管理弹层）
+- **国际化和主题随宿主**（不写回 localStorage）
+
+完整复用清单（宿主 Settings URL、可达性 ping、导航置灰）见 Cursor skill：
+`.cursor/skills/sensors-view-iframe-embed/SKILL.md`。
 
 ## 宿主需要暴露什么
 
-不必改同源 Cookie / 不必提供 HTTP API。只需对 iframe 的 `contentWindow` 做 **`postMessage`**。
+语言 / 主题同步：不必改同源 Cookie / 不必提供 HTTP API。只需对 iframe 的 `contentWindow` 做 **`postMessage`**。
+
+若宿主自带 Settings，还应：
+
+1. 增加可配置的 sensors-view **URL**（写入宿主 localStorage，自动保存）
+2. 宿主启动或 URL 变更后做 **服务端可达性探测**（推荐 `GET {base}/api/health`，失败再探根路径）
+3. **不可达时**禁用进入该页的导航 / 首页入口（置灰，不可跳转）
 
 ### 1. 监听子页就绪（推荐）
 
