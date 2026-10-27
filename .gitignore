@@ -20,6 +20,9 @@ venv/
 *.swp
 .DS_Store
 
+# Local Cursor skills (do not track)
+.cursor/skills/
+
 # Local
 *.log
 .env
